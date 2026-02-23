@@ -103,7 +103,7 @@ async function login(page: Page): Promise<void> {
   await page.locator('#i0118').fill(config.password);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await page.getByRole('button', { name: 'Yes' }).click();
-  await page.waitForLoadState('networkidle');
+  await page.waitForLoadState('domcontentloaded');
   console.log('  Login successful');
 }
 
@@ -117,22 +117,30 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
   // Navigate to receipt process page (full reload resets Angular state)
   await navigateAndWait(page, `${config.baseUrl}/process/RcptMaster#RcptMasterd`);
 
-  // Search by RcptMasterIndex (first visible mat-input is the search field)
-  const searchInput = page.locator('input[id^="mat-input-"]').first();
-  await searchInput.waitFor({ state: 'visible' });
+  // Wait for the Angular form to fully render
+  await page.waitForSelector('input[id^="mat-input-"]', { state: 'visible', timeout: config.navigationTimeoutMs });
+
+  // Search by RcptMasterIndex in the Quick Find dialog
+  const searchInput = page.locator('[pendo-id="e3e-quick-find-search-field"]');
+  await searchInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
   await searchInput.click();
-  await searchInput.fill(receipt.rcptMasterIndex.toString());
+  await page.keyboard.type(receipt.rcptMasterIndex.toString());
+
+  // Click the SEARCH button — the app auto-selects the matching receipt and opens it
   await page.getByRole('button', { name: 'SEARCH' }).click();
-  await page.waitForLoadState('networkidle');
-  await expect(page.locator('e3e-form-renderer')).toBeVisible();
+  await page.locator('e3e-form-renderer').waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  console.log(`    ✓ Receipt ${receipt.rcptMasterIndex} opened`);
 
   // Extract receipt metadata
-  const rcptType = await page
+  const rcptType = (await page
     .locator('[data-automation-id$="attributes/ReceiptType"]')
-    .innerText();
-  const rcptDate = await page
-    .locator('[data-automation-id$="Attributes/RcptDate"]')
-    .innerText();
+    .textContent()) ?? '';
+  const rcptDate = (await page
+    .locator('[data-automation-id$="attributes/RcptDate"]')
+    .textContent()) ?? '';
+
+  // Derive the unit code from the receipt type (e.g. "9200-Something" → "9200")
+  const nxUnit = rcptType.split('-')[0].trim();
 
   // Open the Folder dialog via the toolbar overflow menu
   await page
@@ -142,23 +150,43 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
     .click();
   await page.getByRole('menuitem', { name: 'Folder' }).click();
 
-  // Select unit — type receipt type, then pick the first matching dropdown option
-  await page
-    .locator('#process-folder-unit')
-    .getByRole('button')
-    .filter({ hasText: 'arrow_drop_down' })
-    .click();
-  const unitFilterInput = page.locator('#process-folder-unit').locator('input');
-  await unitFilterInput.fill(rcptType);
-  await page.locator('mat-option').first().click();
+  // Select unit — skip only the unit dropdown when 9100
+  if (nxUnit !== '9100') {
+    const unitDropdownBtn = page
+      .locator('#process-folder-unit')
+      .getByRole('button')
+      .filter({ hasText: 'arrow_drop_down' });
+    await unitDropdownBtn.click();
 
-  // Check the required checkboxes
-  await page
-    .locator('#mat-checkbox-4 > .mat-checkbox-layout > .mat-checkbox-inner-container')
-    .click();
-  await page
-    .locator('#mat-checkbox-6 > .mat-checkbox-layout > .mat-checkbox-inner-container')
-    .click();
+    // Wait for the dropdown panel to be visible before typing
+    await page.locator('.mat-autocomplete-panel, mat-option').first()
+      .waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+
+    const unitFilterInput = page.locator('#process-folder-unit').locator('input');
+    await unitFilterInput.fill(nxUnit);
+
+    // Give Angular time to filter the dropdown options after typing
+    await delay(1000);
+
+    // Wait for the filtered option to appear, then click it
+    const firstOption = page.locator('mat-option').first();
+    await firstOption.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+    await firstOption.click();
+  }
+
+  // Check the Reversal checkbox first, then Reallocate (using stable pendo-id attributes)
+  const reversalCheckbox = page
+    .locator('[pendo-id="/objects/RcptMaster/rows/attributes/IsReversed"] .mat-checkbox-inner-container');
+  await reversalCheckbox.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await reversalCheckbox.click();
+
+  // Wait for Angular to enable the Reallocate checkbox after Reversal is checked
+  await delay(1000);
+
+  const reallocateCheckbox = page
+    .locator('[pendo-id="/objects/RcptMaster/rows/attributes/IsReverseAndReallocate"] .mat-checkbox-inner-container');
+  await reallocateCheckbox.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await reallocateCheckbox.click();
 
   // Fill folder date & description.
   // After the unit dropdown and checkboxes, the last two visible mat-inputs
@@ -178,8 +206,8 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
 
   // Submit the folder update
   await page.getByRole('button', { name: 'Submit', exact: true }).click();
-  await page.waitForLoadState('networkidle');
-
+  await page.waitForLoadState('domcontentloaded'); //TODO wait for rcptMasterIndex to be auto
+  
   // Remove existing invoices, then add each invoice for this receipt
   await page
     .locator('e3e-form-renderer')
@@ -197,11 +225,12 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
     await addDialogInput.fill(invNumber);
 
     await page.getByRole('button', { name: 'SEARCH' }).click();
-    await page.waitForLoadState('networkidle');
 
+    // Wait for the search results to appear
+    await page.getByRole('checkbox', { name: 'Press Space to toggle row' }).waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
     await page.getByRole('checkbox', { name: 'Press Space to toggle row' }).check();
     await page.getByRole('button', { name: 'SELECT', exact: true }).click();
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
   }
 }
 
@@ -279,15 +308,15 @@ async function submitOpenedReceipts(
 
     // Click the last (oldest) item to open it
     await items.last().locator('.action-list-item-content').click();
-    await page.waitForLoadState('networkidle');
-    await expect(page.locator('e3e-form-renderer')).toBeVisible();
+    await page.waitForLoadState('domcontentloaded');
+    await expect(page.locator('e3e-form-renderer')).toBeVisible({ timeout: config.navigationTimeoutMs });
 
     // Verify the updated folder description is present
     await expect(page.locator('e3e-form-renderer')).toContainText(config.folderDescription);
 
     // Submit the receipt
     await page.getByRole('button', { name: 'Submit', exact: true }).click();
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
     // Trigger the Azure Runbook for this receipt
     if (receiptIdx < receiptGroups.length) {
