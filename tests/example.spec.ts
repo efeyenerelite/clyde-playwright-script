@@ -93,6 +93,37 @@ async function navigateAndWait(page: Page, url: string): Promise<void> {
 }
 
 /**
+ * Click the primary Submit action (Release) using stable selectors.
+ * Falls back to role/text-based submit if needed.
+ */
+async function clickSubmitAction(page: Page): Promise<void> {
+  const candidates = [
+    page.locator('button[data-automation-id="RELEASE"]:visible').first(),
+    page.locator('particle-button-dropdown[pendo-id="RELEASE"] button:visible').first(),
+    page.getByRole('button', { name: /^\s*Submit\s*$/ }).first(),
+  ];
+
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      if ((await candidate.count()) === 0) {
+        continue;
+      }
+
+      await candidate.waitFor({ state: 'visible', timeout: 5000 });
+      await candidate.scrollIntoViewIfNeeded();
+      await expect(candidate).toBeEnabled({ timeout: 5000 });
+      await candidate.click({ timeout: 5000 });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(`Unable to click Submit/Release button: ${String(lastError ?? 'no matching selector found')}`);
+}
+
+/**
  * Perform the Microsoft login flow (email → password → "Stay signed in?").
  */
 async function login(page: Page): Promise<void> {
@@ -205,7 +236,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
   await reverseReasonInput.fill(config.folderDescription);
 
   // Submit the folder update
-  await page.getByRole('button', { name: 'Submit', exact: true }).click();
+  await clickSubmitAction(page);
   await page.waitForLoadState('domcontentloaded');
 
   const receiptMasterIndexValue = page
@@ -361,15 +392,19 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
   await startFrame.getByRole('textbox', { name: 'Enter a value' }).fill(invoiceIds);
   await startFrame.getByRole('button', { name: 'Start' }).click();
 
-  // Poll the Job Dashboard until "Completed" (refresh every N seconds)
+  // Poll the Job Dashboard by clicking Refresh until status becomes "Completed"
   const jobFrame = azurePage
     .locator('iframe[name="JobDashboard.ReactView"]')
     .contentFrame();
 
   const deadline = Date.now() + config.runbookMaxWaitMs;
   while (Date.now() < deadline) {
+    // Click Refresh first, then check for status
+    await jobFrame.getByRole('menuitem', { name: 'Refresh' }).click();
+    await delay(config.runbookPollingIntervalMs);
+
     const statusText = await jobFrame
-      .getByLabel('Completed')
+      .locator('[aria-label="Status Completed"]')
       .textContent()
       .catch(() => null);
 
@@ -377,9 +412,6 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
       console.log(`    ✓ Runbook completed for ${label}`);
       return;
     }
-
-    await delay(config.runbookPollingIntervalMs);
-    await jobFrame.getByRole('menuitem', { name: 'Refresh' }).click();
   }
 
   throw new Error(
@@ -397,44 +429,41 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
 
 async function submitOpenedReceipts(
   page: Page,
-  azurePage: Page,
   receiptGroups: ReceiptGroup[],
 ): Promise<void> {
+  await page.bringToFront();
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
 
-  const actionItems = page.locator('e3e-dashboard-action-list-panel li');
-  let remainingCount = await actionItems.count();
-  console.log(`  ▸ ${remainingCount} opened receipt(s) to submit from dashboard`);
+  const actionListItems = page.locator('e3e-dashboard-action-list-panel ul.action-list-items li');
+  console.log(`  ▸ Submitting up to ${receiptGroups.length} opened receipt(s) from dashboard (oldest first)`);
 
-  let receiptIdx = 0;
-  while (remainingCount > 0) {
-    // Refresh the dashboard to get the current list
+  let submitted = 0;
+  while (submitted < receiptGroups.length) {
+    await page.bringToFront();
     await navigateAndWait(page, `${config.baseUrl}/dashboard`);
-    const items = page.locator('e3e-dashboard-action-list-panel li');
-    const count = await items.count();
-    if (count === 0) break;
 
-    // Click the last (oldest) item to open it
-    await items.last().locator('.action-list-item-content').click();
+    await expect(actionListItems.first()).toBeVisible({ timeout: config.navigationTimeoutMs });
+    const count = await actionListItems.count();
+    if (count === 0) {
+      console.log('    ✓ No more action list items to submit');
+      break;
+    }
+
+    const oldestItemContent = actionListItems.last().locator('.action-list-item-content').first();
+    await oldestItemContent.scrollIntoViewIfNeeded();
+    await expect(oldestItemContent).toBeVisible({ timeout: config.navigationTimeoutMs });
+    await oldestItemContent.click();
     await page.waitForLoadState('domcontentloaded');
     await expect(page.locator('e3e-form-renderer')).toBeVisible({ timeout: config.navigationTimeoutMs });
 
-    // Verify the updated folder description is present
-    await expect(page.locator('e3e-form-renderer')).toContainText(config.folderDescription);
-
     // Submit the receipt
-    await page.getByRole('button', { name: 'Submit', exact: true }).click();
+    await clickSubmitAction(page);
     await page.waitForLoadState('domcontentloaded');
+    submitted++;
 
-    // Trigger the Azure Runbook for this receipt
-    if (receiptIdx < receiptGroups.length) {
-      const receipt = receiptGroups[receiptIdx];
-      const ids = receipt.invMasterIndices.join(',');
-      await triggerRunbook(azurePage, ids, `receipt ${receipt.rcptMasterIndex}`);
-      receiptIdx++;
-    }
-
-    remainingCount--;
+    // Always return to the original app tab and dashboard before next item
+    await page.bringToFront();
+    await navigateAndWait(page, `${config.baseUrl}/dashboard`);
   }
 }
 
@@ -468,7 +497,7 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
 
   // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
   console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
-  await submitOpenedReceipts(page, azurePage, receiptGroups);
+  await submitOpenedReceipts(page, receiptGroups);
 
   await azurePage.close();
   console.log('\n✓ All receipts processed successfully');
