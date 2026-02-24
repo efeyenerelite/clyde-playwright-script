@@ -115,7 +115,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
   console.log(`  ▸ Processing receipt ${receipt.rcptMasterIndex} (${receipt.invNumbers.length} invoice(s))`);
 
   // Navigate to receipt process page (full reload resets Angular state)
-  await navigateAndWait(page, `${config.baseUrl}/process/RcptMaster#RcptMasterd`);
+  await navigateAndWait(page, `${config.baseUrl}/process/RcptMaster#RcptMaster`);
 
   // Wait for the Angular form to fully render
   await page.waitForSelector('input[id^="mat-input-"]', { state: 'visible', timeout: config.navigationTimeoutMs });
@@ -163,7 +163,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
       .waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
 
     const unitFilterInput = page.locator('#process-folder-unit').locator('input');
-    await unitFilterInput.fill(nxUnit);
+    await unitFilterInput.fill("Firm");
 
     // Give Angular time to filter the dropdown options after typing
     await delay(1000);
@@ -188,48 +188,100 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
   await reallocateCheckbox.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
   await reallocateCheckbox.click();
 
-  // Fill folder date & description.
-  // After the unit dropdown and checkboxes, the last two visible mat-inputs
-  // are the date field and the description field.
-  const visibleInputs = page.locator('input[id^="mat-input-"]:visible');
-  const inputCount = await visibleInputs.count();
-  const dateInput = visibleInputs.nth(inputCount - 2);
-  const descInput = visibleInputs.nth(inputCount - 1);
+  // Fill Reverse Date & Reversal Reason using stable field attributes.
+  const reverseDateInput = page.locator(
+    'div[pendo-id="/objects/RcptMaster/rows/attributes/ReverseDate"] input.mat-input-element',
+  );
+  const reverseReasonInput = page.locator(
+    'input[pendo-id="/objects/RcptMaster/rows/attributes/ReverseReason"]',
+  );
 
-  await dateInput.click();
-  await dateInput.fill(rcptDate);
-  await descInput.click();
-  await descInput.fill(config.folderDescription);
+  await reverseDateInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await reverseDateInput.click();
+  await reverseDateInput.fill(rcptDate);
 
-  // Click on the main content area to commit pending field changes
-  await page.locator('#main-content mat-sidenav-content').click();
+  await reverseReasonInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await reverseReasonInput.click();
+  await reverseReasonInput.fill(config.folderDescription);
 
   // Submit the folder update
   await page.getByRole('button', { name: 'Submit', exact: true }).click();
   await page.waitForLoadState('domcontentloaded'); //TODO wait for rcptMasterIndex to be auto
   
+  const invoicesTab = page
+    .locator('.mat-tab-label')
+    .filter({ has: page.locator('div[pendo-id="/objects/RcptMaster/rows/childObjects/RcptInvoice"]') })
+    .first();
+  await invoicesTab.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await invoicesTab.click();
+
   // Remove existing invoices, then add each invoice for this receipt
-  await page
-    .locator('e3e-form-renderer')
-    .getByRole('button', { name: 'Remove' })
-    .click();
+  const removeDropdownButton = page
+    .locator('button[data-automation-id*="/childObjects/RcptInvoice/actions/Remove-dropdown"]')
+    .first();
+  await removeDropdownButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await removeDropdownButton.click();
+
+  // Opened menu is rendered in an overlay panel; target only the active visible panel.
+  let removeAllMenuItem = page
+    .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[data-automation-id*="/childObjects/RcptInvoice/actions/btnRemoveAll"]')
+    .first();
+
+  try {
+    await removeAllMenuItem.waitFor({ state: 'visible', timeout: 4000 });
+  } catch {
+    // Retry once in case the first dropdown click did not materialize the menu.
+    await removeDropdownButton.click();
+    removeAllMenuItem = page
+      .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[data-automation-id*="/childObjects/RcptInvoice/actions/btnRemoveAll"]')
+      .first();
+    await removeAllMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  }
+
+  await removeAllMenuItem.click();
 
   for (const invNumber of receipt.invNumbers) {
     console.log(`    ▹ Adding invoice ${invNumber}`);
-    await page.getByRole('button', { name: 'Add' }).nth(1).click();
 
-    // The Add dialog creates a new input — grab the last visible mat-input
-    const addDialogInput = page.locator('input[id^="mat-input-"]:visible').last();
-    await addDialogInput.waitFor({ state: 'visible' });
+    // Open options menu -> Invoices -> Add (overlay submenu) to launch the invoice search dialog.
+    const childFormOptionsButton = page
+      .locator('button.child-form-tabs-btn.options-menu')
+      .first();
+    await childFormOptionsButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+    await childFormOptionsButton.click();
+
+    const invoicesMenuItem = page
+      .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[mat-menu-item]')
+      .filter({ hasText: 'Invoices' })
+      .first();
+    await invoicesMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+    await invoicesMenuItem.hover();
+
+    const overlayAddMenuItem = page
+      .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[mat-menu-item]')
+      .filter({ hasText: /^\s*Add\s*$/ })
+      .first();
+    await overlayAddMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+    await overlayAddMenuItem.click();
+
+    const addDialogInput = page.locator('input[pendo-id="e3e-quick-find-search-field"]:visible').last();
+    await addDialogInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
     await addDialogInput.click();
     await addDialogInput.fill(invNumber);
 
-    await page.getByRole('button', { name: 'SEARCH' }).click();
+    const searchButton = page.locator('button[pendo-id="e3e-query-dialog-search-button"]');
+    await searchButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+    await searchButton.click();
 
-    // Wait for the search results to appear
-    await page.getByRole('checkbox', { name: 'Press Space to toggle row' }).waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await page.getByRole('checkbox', { name: 'Press Space to toggle row' }).check();
-    await page.getByRole('button', { name: 'SELECT', exact: true }).click();
+    const firstResultCheckbox = page
+      .locator('.ag-center-cols-container .ag-row[row-index="0"] input[type="checkbox"]')
+      .first();
+    await firstResultCheckbox.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+    await firstResultCheckbox.check();
+
+    const selectButton = page.locator('button[pendo-id="e3e-query-dialog-select-button"]');
+    await selectButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+    await selectButton.click();
     await page.waitForLoadState('domcontentloaded');
   }
 }
