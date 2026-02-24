@@ -4,13 +4,13 @@
  */
 export const config = {
   // ── Authentication ──────────────────────────────────────────────────
-  email: 'eyener@elite.com',
-  password: 'passwordHere',
+  email: 'testuser@avengersaadcustomer.onmicrosoft.com',
+  password: 'Psw#Avengers-2',
 
   // ── Application URLs ───────────────────────────────────────────────
-  baseUrl: 'https://3e.elite.com/preview',
+  baseUrl: 'https://3e.nonprod.elite.com/dev',
   loginUrl:
-    'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize',
+    'https://3e.nonprod.elite.com/dev?3eInstanceId=ebm7ewj88k6qqse70zhqwg',
   azureRunbookUrl:
     'https://portal.azure.com/#@elite.com/resource/subscriptions/' +
     '58afaec1-7685-42aa-982e-052a84cbf6e8/resourceGroups/test-devl-eastus2/' +
@@ -24,6 +24,6 @@ export const config = {
   // ── Timeouts & polling ─────────────────────────────────────────────
   runbookPollingIntervalMs: 3_000,
   runbookMaxWaitMs: 300_000, // 5 minutes max wait per runbook
-  navigationTimeoutMs: 240_000,
-  defaultTimeoutMs: 240_000,
+  navigationTimeoutMs: 60_000,
+  defaultTimeoutMs: 60_000,
 };

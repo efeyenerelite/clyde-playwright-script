@@ -96,7 +96,7 @@ async function navigateAndWait(page: Page, url: string): Promise<void> {
  * Perform the Microsoft login flow (email → password → "Stay signed in?").
  */
 async function login(page: Page): Promise<void> {
-  await page.goto(config.baseUrl, { waitUntil: 'networkidle', timeout: config.navigationTimeoutMs });
+  await page.goto(config.loginUrl, { waitUntil: 'networkidle', timeout: config.navigationTimeoutMs });
   await page.getByRole('textbox', { name: 'Enter your email or phone' }).click();
   await page.getByRole('textbox', { name: 'Enter your email or phone' }).fill(config.email);
   await page.getByRole('textbox', { name: 'Enter your email or phone' }).press('Enter');
@@ -206,7 +206,18 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
 
   // Submit the folder update
   await page.getByRole('button', { name: 'Submit', exact: true }).click();
-  await page.waitForLoadState('domcontentloaded'); //TODO wait for rcptMasterIndex to be auto
+  await page.waitForLoadState('domcontentloaded');
+
+  const receiptMasterIndexValue = page
+    .locator('[data-automation-id$="/attributes/RcptIndex"]')
+    .first();
+  await receiptMasterIndexValue.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await expect
+    .poll(
+      async () => ((await receiptMasterIndexValue.textContent()) ?? '').replace(/\s+/g, ' ').trim(),
+      { timeout: config.navigationTimeoutMs, message: 'Waiting for Receipt Master Index to become <AUTO>' },
+    )
+    .toBe('<AUTO>');
   
   const invoicesTab = page
     .locator('.mat-tab-label')
@@ -216,29 +227,74 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
   await invoicesTab.click();
 
   // Remove existing invoices, then add each invoice for this receipt
-  const removeDropdownButton = page
-    .locator('button[data-automation-id*="/childObjects/RcptInvoice/actions/Remove-dropdown"]')
+  const removeActionsContainer = page
+    .locator('div[pendo-id="/objects/RcptMaster/rows/childObjects/RcptInvoice/actions/Remove"]')
     .first();
-  await removeDropdownButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await removeDropdownButton.click();
+  await expect(removeActionsContainer).toBeVisible({ timeout: config.navigationTimeoutMs });
 
-  // Opened menu is rendered in an overlay panel; target only the active visible panel.
-  let removeAllMenuItem = page
-    .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[data-automation-id*="/childObjects/RcptInvoice/actions/btnRemoveAll"]')
-    .first();
+  const removeDropdownButtons = removeActionsContainer
+    .locator('button[data-automation-id$="/childObjects/RcptInvoice/actions/Remove-dropdown"]:visible');
 
-  try {
-    await removeAllMenuItem.waitFor({ state: 'visible', timeout: 4000 });
-  } catch {
-    // Retry once in case the first dropdown click did not materialize the menu.
-    await removeDropdownButton.click();
-    removeAllMenuItem = page
-      .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[data-automation-id*="/childObjects/RcptInvoice/actions/btnRemoveAll"]')
-      .first();
-    await removeAllMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  async function getActiveRemoveDropdownButton() {
+    const count = await removeDropdownButtons.count();
+    if (count === 0) {
+      throw new Error('Remove dropdown button was not found in Remove actions container');
+    }
+    return removeDropdownButtons.nth(count - 1);
   }
 
-  await removeAllMenuItem.click();
+  async function openRemoveMenuAndClickRemoveAll(): Promise<void> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const removeDropdownButton = await getActiveRemoveDropdownButton();
+        await expect(removeDropdownButton).toBeVisible({ timeout: config.navigationTimeoutMs });
+        await expect(removeDropdownButton).toBeEnabled({ timeout: config.navigationTimeoutMs });
+
+        if ((await removeDropdownButton.getAttribute('aria-expanded')) === 'true') {
+          await page.keyboard.press('Escape');
+          await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'false', { timeout: 2000 });
+        }
+
+        await removeDropdownButton.scrollIntoViewIfNeeded();
+        await delay(500);
+        await removeDropdownButton.click();
+
+        if ((await removeDropdownButton.getAttribute('aria-expanded')) !== 'true') {
+          await delay(300);
+          await removeDropdownButton.click({ force: true });
+        }
+
+        await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'true', { timeout: 4000 });
+
+        const menuId = await removeDropdownButton.getAttribute('aria-controls');
+        if (!menuId) {
+          throw new Error('Remove dropdown did not expose aria-controls after opening menu');
+        }
+
+        const activeMenuPanel = page.locator(`#${menuId}`);
+        await expect(activeMenuPanel).toBeVisible({ timeout: 4000 });
+
+        const removeAllMenuItem = activeMenuPanel
+          .locator('button[data-automation-id$="/childObjects/RcptInvoice/actions/btnRemoveAll"]')
+          .first();
+        await expect(removeAllMenuItem).toBeVisible({ timeout: 3000 });
+        await removeAllMenuItem.click({ timeout: 3000 });
+
+        await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'false', { timeout: 4000 });
+        return;
+      } catch (error) {
+        lastError = error;
+        await page.keyboard.press('Escape');
+        await delay(400);
+      }
+    }
+
+    throw lastError;
+  }
+
+  await openRemoveMenuAndClickRemoveAll();
 
   for (const invNumber of receipt.invNumbers) {
     console.log(`    ▹ Adding invoice ${invNumber}`);
@@ -284,15 +340,15 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
     await selectButton.click();
     await page.waitForLoadState('domcontentloaded');
   }
+  await navigateAndWait(page, `${config.baseUrl}/dashboard`);
 }
 
 /* ================================================================== *
  *  Phase 2 – Trigger Azure Automation Runbook for each receipt        *
  * ================================================================== */
 
-async function triggerRunbook(azurePage: Page, receipt: ReceiptGroup): Promise<void> {
-  const invoiceIds = receipt.invMasterIndices.join(',');
-  console.log(`  ▸ Triggering runbook for receipt ${receipt.rcptMasterIndex} — invoices: ${invoiceIds}`);
+async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string): Promise<void> {
+  console.log(`  ▸ Triggering runbook for ${label} — invoices: ${invoiceIds}`);
 
   await navigateAndWait(azurePage, config.azureRunbookUrl);
 
@@ -318,7 +374,7 @@ async function triggerRunbook(azurePage: Page, receipt: ReceiptGroup): Promise<v
       .catch(() => null);
 
     if (statusText?.includes('Completed')) {
-      console.log(`    ✓ Runbook completed for receipt ${receipt.rcptMasterIndex}`);
+      console.log(`    ✓ Runbook completed for ${label}`);
       return;
     }
 
@@ -327,7 +383,7 @@ async function triggerRunbook(azurePage: Page, receipt: ReceiptGroup): Promise<v
   }
 
   throw new Error(
-    `Runbook for receipt ${receipt.rcptMasterIndex} did not complete within ${config.runbookMaxWaitMs / 1000}s`,
+    `Runbook for ${label} did not complete within ${config.runbookMaxWaitMs / 1000}s`,
   );
 }
 
@@ -372,7 +428,9 @@ async function submitOpenedReceipts(
 
     // Trigger the Azure Runbook for this receipt
     if (receiptIdx < receiptGroups.length) {
-      await triggerRunbook(azurePage, receiptGroups[receiptIdx]);
+      const receipt = receiptGroups[receiptIdx];
+      const ids = receipt.invMasterIndices.join(',');
+      await triggerRunbook(azurePage, ids, `receipt ${receipt.rcptMasterIndex}`);
       receiptIdx++;
     }
 
@@ -399,13 +457,14 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
     await processReceipt(page, receipt);
   }
 
-  // ── Phase 2: Trigger Azure Runbook per receipt ───────────────────
-  console.log('\n═══ Phase 2: Trigger Azure Runbooks ═══');
+  // ── Phase 2: Trigger Azure Runbook with all invoices from Phase 1 ─
+  console.log('\n═══ Phase 2: Trigger Azure Runbook ═══');
   const azurePage: Page = await context.newPage();
 
-  for (const receipt of receiptGroups) {
-    await triggerRunbook(azurePage, receipt);
-  }
+  const allInvMasterIndices = [...new Set(receiptGroups.flatMap(r => r.invMasterIndices))];
+  const allInvoiceIds = allInvMasterIndices.join(',');
+  console.log(`  Collected ${allInvMasterIndices.length} distinct invoice(s) from ${receiptGroups.length} receipt(s)`);
+  await triggerRunbook(azurePage, allInvoiceIds, `all ${receiptGroups.length} receipt(s)`);
 
   // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
   console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
