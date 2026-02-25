@@ -1,0 +1,20 @@
+5301536 ....
+19602952	5760009	1100-0423292	740983	5290433	2025-09-19 00:00:00.000	GBP	-7376.22	-6163.30	Receipt	0	TimeRcpt	19602952	GBP	6064.60	6064.60	-98.70	CORRUPTED
+19602953	5760009	1100-0423292	751206	5290433	2025-09-19 00:00:00.000	GBP	-138.18	-98.70	Receipt	0	TimeRcpt	19602953	GBP	197.40	197.40	98.70	CORRUPTED
+5442950 (12 Invoice)
+5347811 Matter does not allow payment activity. Receipt cannot be reversed.
+5349310 Matter does not allow payment activity. Receipt cannot be reversed.
+
+Total receipt amount does not match detail receipts. Receipt amount: 2297.89 Detail receipts: 2296.10
+19783945	5808082	3100-0136359	1201954	5334548	2025-11-04 00:00:00.000	SAR	-1221.32	-1221.32	Receipt	0	TimeRcpt	19783945	SAR	1229.89	1229.89	8.57	CORRUPTED
+
+Total receipt amount does not match detail receipts. Receipt amount: 4508.09 Detail receipts: 4504.59
+19783945	5808082	3100-0136359	1201954	5334548	2025-11-04 00:00:00.000	SAR	-1221.32	-1221.32	Receipt	0	TimeRcpt	19783945	SAR	1229.89	1229.89	8.57	CORRUPTED
+
+5443069  Updating invoice payor balance would cause invoice number 1100-0463320 to be overpaid. See if invoice is already paid and try again.
+
+5351597 Matter does not allow payment activity. Receipt cannot be reversed.
+5351628 Matter does not allow payment activity. Receipt cannot be reversed.
+5351631 Matter does not allow payment activity. Receipt cannot be reversed.
+
+19826370	6017174	1100-0459918	1263339	5351404	2025-11-19 00:00:00.000	GBP	-3831.92	-3831.92	Receipt	0	TimeRcpt	19826370	GBP	3831.75	3831.75	-0.17	CORRUPTED

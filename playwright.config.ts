@@ -15,13 +15,13 @@ export default defineConfig({
   retries: 0,
   workers: 1,
   reporter: 'html',
-  timeout: 600_000, // 10 min per test (long receipt-processing workflow)
-  expect: { timeout: 30_000 },
+  timeout: 2_700_000, // 45 min per test (customer-environment safe)
+  expect: { timeout: 60_000 },
   use: {
     headless: false,
     trace: 'on-first-retry',
-    actionTimeout: 240_000,
-    navigationTimeout: 240_000,
+    actionTimeout: 300_000,
+    navigationTimeout: 300_000,
     viewport: null,       // disable fixed viewport — use full window size
     launchOptions: {
       args: ['--start-maximized'],

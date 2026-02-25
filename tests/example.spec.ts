@@ -13,6 +13,7 @@ interface MalformedEntry {
   invNumber: string;
   rcptMasterIndex: number;
   difference: number;
+  status: string;
 }
 
 interface ReceiptGroup {
@@ -20,7 +21,7 @@ interface ReceiptGroup {
   entries: MalformedEntry[];
   /** Unique invoice numbers for UI search */
   invNumbers: string[];
-  /** Unique InvMasterIndex values for the Azure Runbook parameter */
+  /** Unique InvMasterIndex values for the Azure Runbook parameter (CORRUPTED rows only) */
   invMasterIndices: number[];
 }
 
@@ -52,6 +53,7 @@ function parseMalformedData(): MalformedEntry[] {
       invNumber: cols[2].trim(),
       rcptMasterIndex: parseInt(cols[4].trim(), 10),
       difference: parseFloat(cols[16].trim()),
+      status: (cols[17] ?? 'CORRUPTED').trim().toUpperCase(),
     };
   });
 }
@@ -74,7 +76,13 @@ function groupByReceipt(entries: MalformedEntry[]): ReceiptGroup[] {
     rcptMasterIndex,
     entries: groupEntries,
     invNumbers: [...new Set(groupEntries.map(e => e.invNumber))],
-    invMasterIndices: [...new Set(groupEntries.map(e => e.invMasterIndex))],
+    invMasterIndices: [
+      ...new Set(
+        groupEntries
+          .filter(e => e.status === 'CORRUPTED')
+          .map(e => e.invMasterIndex),
+      ),
+    ],
   }));
 }
 
@@ -133,6 +141,23 @@ async function clickSubmitAction(page: Page): Promise<void> {
   }
 
   throw new Error(`Unable to click Submit/Release button: ${String(lastError ?? 'no matching selector found')}`);
+}
+
+async function waitForReceiptMasterIndexAuto(page: Page, contextLabel: string): Promise<void> {
+  const receiptMasterIndexValue = page
+    .locator('[data-automation-id$="/attributes/RcptIndex"]')
+    .first();
+
+  await receiptMasterIndexValue.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await expect
+    .poll(
+      async () => ((await receiptMasterIndexValue.textContent()) ?? '').replace(/\s+/g, ' ').trim(),
+      {
+        timeout: config.navigationTimeoutMs,
+        message: `[${contextLabel}] Waiting for Receipt Master Index to become <AUTO>`,
+      },
+    )
+    .toBe('<AUTO>');
 }
 
 /**
@@ -250,22 +275,14 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
   // Submit the folder update
   await clickSubmitAction(page);
   await page.waitForLoadState('domcontentloaded');
-
-  const receiptMasterIndexValue = page
-    .locator('[data-automation-id$="/attributes/RcptIndex"]')
-    .first();
-  await receiptMasterIndexValue.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await expect
-    .poll(
-      async () => ((await receiptMasterIndexValue.textContent()) ?? '').replace(/\s+/g, ' ').trim(),
-      { timeout: config.navigationTimeoutMs, message: 'Waiting for Receipt Master Index to become <AUTO>' },
-    )
-    .toBe('<AUTO>');
+  await waitForReceiptMasterIndexAuto(page, 'Phase 1 post-folder-submit');
   
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
 }
 
 async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise<void> {
+  await waitForReceiptMasterIndexAuto(page, `Phase 3 pre-invoice-update receipt ${receipt.rcptMasterIndex}`);
+
   const invoicesTab = page
     .locator('.mat-tab-label')
     .filter({ has: page.locator('div[pendo-id="/objects/RcptMaster/rows/childObjects/RcptInvoice"]') })
@@ -343,10 +360,7 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
 
   await openRemoveMenuAndClickRemoveAll();
 
-  for (const invNumber of receipt.invNumbers) {
-    console.log(`    ▹ Adding invoice ${invNumber}`);
-
-    // Open options menu -> Invoices -> Add (overlay submenu) to launch the invoice search dialog.
+  async function openInvoiceSearchDialogFromOptionsMenu(): Promise<void> {
     const childFormOptionsButton = page
       .locator('button.child-form-tabs-btn.options-menu')
       .first();
@@ -366,7 +380,17 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
       .first();
     await overlayAddMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
     await overlayAddMenuItem.click();
+  }
 
+  async function openInvoiceSearchDialogFromDirectAddButton(): Promise<void> {
+    const directAddButton = page
+      .locator('button[data-automation-id$="/childObjects/RcptInvoice/actions/AddByQuery"]:visible')
+      .first();
+    await directAddButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+    await directAddButton.click();
+  }
+
+  async function searchAndSelectInvoice(invNumber: string): Promise<void> {
     const addDialogInput = page.locator('input[pendo-id="e3e-quick-find-search-field"]:visible').last();
     await addDialogInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
     await addDialogInput.click();
@@ -387,6 +411,20 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
     await selectButton.click();
     await page.waitForLoadState('domcontentloaded');
   }
+
+  for (const [invoiceIndex, invNumber] of receipt.invNumbers.entries()) {
+    console.log(`    ▹ Adding invoice ${invNumber}`);
+
+    if (invoiceIndex === 0) {
+      await openInvoiceSearchDialogFromOptionsMenu();
+    } else {
+      await openInvoiceSearchDialogFromDirectAddButton();
+    }
+
+    await searchAndSelectInvoice(invNumber);
+  }
+
+  await waitForReceiptMasterIndexAuto(page, `Phase 3 post-invoice-update receipt ${receipt.rcptMasterIndex}`);
 }
 
 /* ================================================================== *
@@ -451,20 +489,35 @@ async function submitOpenedReceipts(
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
 
   const actionListItems = page.locator('e3e-dashboard-action-list-panel ul.action-list-items li');
-  console.log(`  ▸ Submitting up to ${receiptGroups.length} opened receipt(s) from dashboard (oldest first)`);
+  console.log(`  ▸ Draining all opened processes from action list`);
 
+  // Queue of receipt groups whose invoices still need updating.
+  // Items beyond the queue (leftover from previous runs) are submitted as-is.
+  const receiptQueue = [...receiptGroups];
   let submitted = 0;
-  while (submitted < receiptGroups.length) {
-    await page.bringToFront();
-    await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+  // Safety limit: expect at most the batch size + a generous margin for leftovers
+  const maxIterations = receiptGroups.length + 20;
 
-    await expect(actionListItems.first()).toBeVisible({ timeout: config.navigationTimeoutMs });
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    // On subsequent iterations, navigate to dashboard for a fresh action list
+    if (iteration > 0) {
+      await page.bringToFront();
+      await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+    }
+
+    // Allow the action list to fully render
+    await delay(2000);
+
     const count = await actionListItems.count();
     if (count === 0) {
-      console.log('    ✓ No more action list items to submit');
+      console.log('    ✓ Action list is empty — all processes submitted');
       break;
     }
 
+    console.log(`    Action list has ${count} item(s) remaining`);
+    await expect(actionListItems.first()).toBeVisible({ timeout: config.navigationTimeoutMs });
+
+    // Open the oldest item (last in the list)
     const oldestItemContent = actionListItems.last().locator('.action-list-item-content').first();
     await oldestItemContent.scrollIntoViewIfNeeded();
     await expect(oldestItemContent).toBeVisible({ timeout: config.navigationTimeoutMs });
@@ -472,19 +525,40 @@ async function submitOpenedReceipts(
     await page.waitForLoadState('domcontentloaded');
     await expect(page.locator('e3e-form-renderer')).toBeVisible({ timeout: config.navigationTimeoutMs });
 
-    const receipt = receiptGroups[submitted];
-    console.log(`    ▹ Updating invoices for receipt ${receipt.rcptMasterIndex}`);
-    await updateReceiptInvoices(page, receipt);
+    // Update invoices if we still have a matching receipt group in the queue
+    if (receiptQueue.length > 0) {
+      const receipt = receiptQueue.shift()!;
+      console.log(`    ▹ Updating invoices for receipt ${receipt.rcptMasterIndex}`);
+      await updateReceiptInvoices(page, receipt);
+    } else {
+      console.log(`    ▹ Extra action list item (no matching receipt group) — submitting without invoice changes`);
+    }
 
     // Submit the receipt
     await clickSubmitAction(page);
-    await page.waitForLoadState('domcontentloaded');
-    submitted++;
 
-    // Always return to the original app tab and dashboard before next item
-    await page.bringToFront();
-    await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+    // CRITICAL: Wait for the submit to fully complete before navigating away.
+    // The form closes and the page returns to the dashboard on success.
+    // If we navigate before this completes, the server request is aborted
+    // and the process stays open in the action list.
+    await page.locator('e3e-form-renderer').waitFor({ state: 'hidden', timeout: config.navigationTimeoutMs });
+    await page.waitForLoadState('networkidle', { timeout: config.navigationTimeoutMs });
+
+    submitted++;
+    console.log(`    ✓ Submit completed (${submitted} total)`);
   }
+
+  // Final verification: navigate to dashboard and confirm the action list is empty
+  await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+  await delay(2000);
+  const remainingCount = await actionListItems.count();
+  if (remainingCount > 0) {
+    throw new Error(
+      `Action list still has ${remainingCount} item(s) after ${submitted} submission(s). ` +
+      `Manual intervention may be required.`,
+    );
+  }
+  console.log(`  ✓ Verified: action list is empty after submitting ${submitted} process(es)`);
 }
 
 /* ================================================================== *
@@ -525,14 +599,18 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
     const batchInvMasterIndices = [...new Set(batch.flatMap(r => r.invMasterIndices))];
     const batchInvoiceIds = batchInvMasterIndices.join(',');
     console.log(
-      `  Collected ${batchInvMasterIndices.length} distinct invoice(s) from ` +
+      `  Collected ${batchInvMasterIndices.length} distinct CORRUPTED invoice(s) from ` +
       `${batch.length} receipt(s) in current batch`,
     );
-    await triggerRunbook(
-      azurePage,
-      batchInvoiceIds,
-      `batch ${batchIndex + 1} (${batch.length} receipt(s))`,
-    );
+    if (batchInvMasterIndices.length > 0) {
+      await triggerRunbook(
+        azurePage,
+        batchInvoiceIds,
+        `batch ${batchIndex + 1} (${batch.length} receipt(s))`,
+      );
+    } else {
+      console.log('  No CORRUPTED invoices in this batch; skipping runbook trigger');
+    }
 
     // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
     console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');

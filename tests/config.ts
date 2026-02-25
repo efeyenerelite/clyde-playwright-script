@@ -10,7 +10,7 @@ export const config = {
   // ── Application URLs ───────────────────────────────────────────────
   baseUrl: 'https://3e.elite.com/preview',
   loginUrl:
-    'https://3e.elite.com/preview?3eInstanceId=rmkdfcsyzeyamk8gx9xkdg&pam=true',
+    'https://3e.elite.com/preview',
   azureRunbookUrl:
     'https://portal.azure.com/#@elite.com/resource/subscriptions/' +
     '5b88baaf-89a1-40b3-8cc5-44ccb35a3481/resourceGroups/cloudops-db-maintenance/' +
@@ -20,11 +20,11 @@ export const config = {
   // ── Test data ──────────────────────────────────────────────────────
   malformedDataFile: 'malformedData', // relative to resources/
   folderDescription: 'UpdatedInfo',
-  receiptBatchSize: 10,
+  receiptBatchSize: 20,
 
   // ── Timeouts & polling ─────────────────────────────────────────────
   runbookPollingIntervalMs: 3_000,
-  runbookMaxWaitMs: 300_000, // 5 minutes max wait per runbook
-  navigationTimeoutMs: 60_000,
-  defaultTimeoutMs: 60_000,
+  runbookMaxWaitMs: 3_000_000, // 50 minutes max wait per runbook
+  navigationTimeoutMs: 600_000,
+  defaultTimeoutMs: 600_000,
 };
