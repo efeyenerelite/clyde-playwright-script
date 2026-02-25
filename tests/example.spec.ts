@@ -84,6 +84,18 @@ function groupByReceipt(entries: MalformedEntry[]): ReceiptGroup[] {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+function chunkArray<T>(items: T[], size: number): T[][] {
+  if (size <= 0) {
+    throw new Error(`Invalid batch size: ${size}. receiptBatchSize must be greater than 0.`);
+  }
+
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
 /**
  * Navigate and wait for the Angular SPA to settle.
  * A full page.goto forces Angular to re-bootstrap, resetting mat-input IDs.
@@ -139,7 +151,7 @@ async function login(page: Page): Promise<void> {
 }
 
 /* ================================================================== *
- *  Phase 1 – Open each receipt, update Folder info, add invoices      *
+ *  Phase 1 – Open each receipt and perform reverse action             *
  * ================================================================== */
 
 async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> {
@@ -194,7 +206,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
       .waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
 
     const unitFilterInput = page.locator('#process-folder-unit').locator('input');
-    await unitFilterInput.fill("Firm");
+    await unitFilterInput.fill(nxUnit);
 
     // Give Angular time to filter the dropdown options after typing
     await delay(1000);
@@ -250,6 +262,10 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
     )
     .toBe('<AUTO>');
   
+  await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+}
+
+async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise<void> {
   const invoicesTab = page
     .locator('.mat-tab-label')
     .filter({ has: page.locator('div[pendo-id="/objects/RcptMaster/rows/childObjects/RcptInvoice"]') })
@@ -257,7 +273,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
   await invoicesTab.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
   await invoicesTab.click();
 
-  // Remove existing invoices, then add each invoice for this receipt
+  // Remove existing invoices, then add each invoice for this receipt.
   const removeActionsContainer = page
     .locator('div[pendo-id="/objects/RcptMaster/rows/childObjects/RcptInvoice/actions/Remove"]')
     .first();
@@ -371,7 +387,6 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
     await selectButton.click();
     await page.waitForLoadState('domcontentloaded');
   }
-  await navigateAndWait(page, `${config.baseUrl}/dashboard`);
 }
 
 /* ================================================================== *
@@ -381,6 +396,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
 async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string): Promise<void> {
   console.log(`  ▸ Triggering runbook for ${label} — invoices: ${invoiceIds}`);
 
+  await azurePage.bringToFront();
   await navigateAndWait(azurePage, config.azureRunbookUrl);
 
   await azurePage.getByRole('button', { name: 'Start' }).click();
@@ -424,7 +440,7 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
  *                                                                     *
  *  The "My Action List" panel shows opened processes.                 *
  *  The oldest entry is at the bottom of the list.                     *
- *  For each one: open → verify → submit → trigger runbook → repeat.  *
+ *  For each one: open → remove/add invoices → submit → repeat.        *
  * ================================================================== */
 
 async function submitOpenedReceipts(
@@ -456,6 +472,10 @@ async function submitOpenedReceipts(
     await page.waitForLoadState('domcontentloaded');
     await expect(page.locator('e3e-form-renderer')).toBeVisible({ timeout: config.navigationTimeoutMs });
 
+    const receipt = receiptGroups[submitted];
+    console.log(`    ▹ Updating invoices for receipt ${receipt.rcptMasterIndex}`);
+    await updateReceiptInvoices(page, receipt);
+
     // Submit the receipt
     await clickSubmitAction(page);
     await page.waitForLoadState('domcontentloaded');
@@ -475,29 +495,49 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
   // ── Parse malformed data and group by receipt ──────────────────────
   const entries = parseMalformedData();
   const receiptGroups = groupByReceipt(entries);
-  console.log(`Parsed ${entries.length} entries across ${receiptGroups.length} receipt(s)\n`);
+  const batches = chunkArray(receiptGroups, config.receiptBatchSize);
+  console.log(
+    `Parsed ${entries.length} entries across ${receiptGroups.length} receipt(s); ` +
+    `processing in ${batches.length} batch(es) of up to ${config.receiptBatchSize}\n`,
+  );
 
   // ── Login via Microsoft (same flow as the original codegen script) ─
   await login(page);
 
-  // ── Phase 1: Open each receipt, update folder, add invoices ──────
-  console.log('═══ Phase 1: Process receipts ═══');
-  for (const receipt of receiptGroups) {
-    await processReceipt(page, receipt);
-  }
-
-  // ── Phase 2: Trigger Azure Runbook with all invoices from Phase 1 ─
-  console.log('\n═══ Phase 2: Trigger Azure Runbook ═══');
   const azurePage: Page = await context.newPage();
+  await page.bringToFront();
 
-  const allInvMasterIndices = [...new Set(receiptGroups.flatMap(r => r.invMasterIndices))];
-  const allInvoiceIds = allInvMasterIndices.join(',');
-  console.log(`  Collected ${allInvMasterIndices.length} distinct invoice(s) from ${receiptGroups.length} receipt(s)`);
-  await triggerRunbook(azurePage, allInvoiceIds, `all ${receiptGroups.length} receipt(s)`);
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+    const batch = batches[batchIndex];
+    console.log(
+      `\n═══ Batch ${batchIndex + 1}/${batches.length} ` +
+      `(${batch.length} receipt(s)) ═══`,
+    );
 
-  // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
-  console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
-  await submitOpenedReceipts(page, receiptGroups);
+    // ── Phase 1: Open each receipt and perform reverse action ────────
+    console.log('═══ Phase 1: Process receipts ═══');
+    for (const receipt of batch) {
+      await processReceipt(page, receipt);
+    }
+
+    // ── Phase 2: Trigger Azure Runbook with invoices from this batch ─
+    console.log('\n═══ Phase 2: Trigger Azure Runbook ═══');
+    const batchInvMasterIndices = [...new Set(batch.flatMap(r => r.invMasterIndices))];
+    const batchInvoiceIds = batchInvMasterIndices.join(',');
+    console.log(
+      `  Collected ${batchInvMasterIndices.length} distinct invoice(s) from ` +
+      `${batch.length} receipt(s) in current batch`,
+    );
+    await triggerRunbook(
+      azurePage,
+      batchInvoiceIds,
+      `batch ${batchIndex + 1} (${batch.length} receipt(s))`,
+    );
+
+    // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
+    console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
+    await submitOpenedReceipts(page, batch);
+  }
 
   await azurePage.close();
   console.log('\n✓ All receipts processed successfully');

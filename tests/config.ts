@@ -4,22 +4,23 @@
  */
 export const config = {
   // ── Authentication ──────────────────────────────────────────────────
-  email: 'testuser@avengersaadcustomer.onmicrosoft.com',
-  password: 'Psw#Avengers-2',
+  email: 'eyener@elite.com',
+  password: 'passHere',
 
   // ── Application URLs ───────────────────────────────────────────────
-  baseUrl: 'https://3e.nonprod.elite.com/dev',
+  baseUrl: 'https://3e.elite.com/preview',
   loginUrl:
-    'https://3e.nonprod.elite.com/dev?3eInstanceId=ebm7ewj88k6qqse70zhqwg',
+    'https://3e.elite.com/preview?3eInstanceId=rmkdfcsyzeyamk8gx9xkdg&pam=true',
   azureRunbookUrl:
     'https://portal.azure.com/#@elite.com/resource/subscriptions/' +
-    '58afaec1-7685-42aa-982e-052a84cbf6e8/resourceGroups/test-devl-eastus2/' +
+    '5b88baaf-89a1-40b3-8cc5-44ccb35a3481/resourceGroups/cloudops-db-maintenance/' +
     'providers/Microsoft.Automation/automationAccounts/' +
-    'testAzureAutomationAccount/runbooks/test-Clyde-update/overview',
+    'db-automation-pprd/runbooks/Clyde-Stage-rmkdfcsyzeyamk8gx9xkdg-Report/overview',
 
   // ── Test data ──────────────────────────────────────────────────────
   malformedDataFile: 'malformedData', // relative to resources/
   folderDescription: 'UpdatedInfo',
+  receiptBatchSize: 10,
 
   // ── Timeouts & polling ─────────────────────────────────────────────
   runbookPollingIntervalMs: 3_000,
