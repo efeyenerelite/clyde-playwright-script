@@ -133,7 +133,7 @@ async function dismissPopup(page: Page): Promise<void> {
   try {
     const closeButton = page.locator('snack-bar-container mat-icon.close-alert');
     if (await closeButton.isVisible()) {
-      await closeButton.click();
+      await stableClick(closeButton, 'Snackbar close button', { retries: 2 });
       await delay(500);
     }
   } catch {
@@ -147,11 +147,11 @@ async function dismissPopup(page: Page): Promise<void> {
 async function cancelCurrentRow(page: Page): Promise<void> {
   const cancelButton = page.locator('button[data-automation-id="CANCEL"]');
   await cancelButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await cancelButton.click();
+  await stableClick(cancelButton, 'Cancel button');
 
   const confirmYesButton = page.locator('button[data-automation-id="cancel-dialog-yes-button"]');
   await confirmYesButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await confirmYesButton.click();
+  await stableClick(confirmYesButton, 'Cancel confirmation Yes button');
   await page.waitForLoadState('domcontentloaded');
   console.log('    \u2717 Row cancelled');
 }
@@ -180,7 +180,7 @@ async function getCurrentReceiptIndex(page: Page): Promise<string | null> {
     .first();
 
   try {
-    await rcptIndexLocator.waitFor({ state: 'visible', timeout: 5000 });
+    await rcptIndexLocator.waitFor({ state: 'visible', timeout: config.defaultTimeoutMs });
     const text = ((await rcptIndexLocator.textContent()) ?? '')
       .replace(/\s+/g, ' ')
       .trim();
@@ -306,6 +306,44 @@ async function navigateAndWait(page: Page, url: string): Promise<void> {
   await page.goto(url, { waitUntil: 'networkidle', timeout: config.navigationTimeoutMs });
 }
 
+async function stableClick(
+  target: Locator,
+  label: string,
+  options?: {
+    timeoutMs?: number;
+    retries?: number;
+    forceOnLastRetry?: boolean;
+  },
+): Promise<void> {
+  const timeoutMs = options?.timeoutMs ?? config.defaultTimeoutMs;
+  const retries = options?.retries ?? 3;
+  const forceOnLastRetry = options?.forceOnLastRetry ?? true;
+
+  await target.waitFor({ state: 'visible', timeout: timeoutMs });
+  await expect(target).toBeEnabled({ timeout: timeoutMs });
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await target.click({ timeout: timeoutMs, trial: true });
+      await target.click({ timeout: timeoutMs });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) {
+        await delay(200 * attempt);
+      }
+    }
+  }
+
+  if (forceOnLastRetry) {
+    await target.click({ timeout: timeoutMs, force: true });
+    return;
+  }
+
+  throw new Error(`Stable click failed for ${label}: ${String(lastError ?? 'unknown error')}`);
+}
+
 /**
  * Open the oldest action-list item without triggering Playwright's auto-scroll loop.
  * Uses DOM click first (no auto-scroll), then a force-click fallback.
@@ -329,14 +367,14 @@ async function openOldestActionListItem(page: Page, actionListItems: Locator): P
         htmlElement.click();
       });
 
-      await expect(formRenderer).toBeVisible({ timeout: 7000 });
+      await expect(formRenderer).toBeVisible({ timeout: config.defaultTimeoutMs });
       return;
     } catch {
       // Try the next target/fallback path
     }
   }
 
-  await oldestRow.click({ force: true, timeout: 5000 });
+  await oldestRow.click({ force: true, timeout: config.defaultTimeoutMs });
   await expect(formRenderer).toBeVisible({ timeout: config.navigationTimeoutMs });
 }
 
@@ -358,10 +396,7 @@ async function clickSubmitAction(page: Page): Promise<void> {
         continue;
       }
 
-      await candidate.waitFor({ state: 'visible', timeout: 5000 });
-      await candidate.scrollIntoViewIfNeeded();
-      await expect(candidate).toBeEnabled({ timeout: 5000 });
-      await candidate.click({ timeout: 5000 });
+      await stableClick(candidate, 'Submit/Release button', { retries: 3 });
       return;
     } catch (error) {
       lastError = error;
@@ -393,12 +428,12 @@ async function waitForReceiptMasterIndexAuto(page: Page, contextLabel: string): 
  */
 async function login(page: Page): Promise<void> {
   await page.goto(config.loginUrl, { waitUntil: 'networkidle', timeout: config.navigationTimeoutMs });
-  await page.getByRole('textbox', { name: 'Enter your email or phone' }).click();
+  await stableClick(page.getByRole('textbox', { name: 'Enter your email or phone' }), 'Login email input');
   await page.getByRole('textbox', { name: 'Enter your email or phone' }).fill(config.email);
   await page.getByRole('textbox', { name: 'Enter your email or phone' }).press('Enter');
   await page.locator('#i0118').fill(config.password);
-  await page.getByRole('button', { name: 'Sign in' }).click();
-  await page.getByRole('button', { name: 'Yes' }).click();
+  await stableClick(page.getByRole('button', { name: 'Sign in' }), 'Login Sign in button');
+  await stableClick(page.getByRole('button', { name: 'Yes' }), 'Stay signed in Yes button');
   await page.waitForLoadState('domcontentloaded');
   console.log('  Login successful');
 }
@@ -419,11 +454,11 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
   // Search by RcptMasterIndex in the Quick Find dialog
   const searchInput = page.locator('[pendo-id="e3e-quick-find-search-field"]');
   await searchInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await searchInput.click();
+  await stableClick(searchInput, 'Receipt quick-find input');
   await page.keyboard.type(receipt.rcptMasterIndex.toString());
 
   // Click the SEARCH button — the app auto-selects the matching receipt and opens it
-  await page.getByRole('button', { name: 'SEARCH' }).click();
+  await stableClick(page.getByRole('button', { name: 'SEARCH' }), 'Receipt SEARCH button');
   await page.locator('e3e-form-renderer').waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
   console.log(`    ✓ Receipt ${receipt.rcptMasterIndex} opened`);
 
@@ -439,12 +474,15 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
   const nxUnit = rcptType.split('-')[0].trim();
 
   // Open the Folder dialog via the toolbar overflow menu
-  await page
-    .locator('e3e-process-toolbar')
-    .getByRole('button')
-    .filter({ hasText: 'more_vert' })
-    .click();
-  await page.getByRole('menuitem', { name: 'Folder' }).click();
+  await stableClick(
+    page
+      .locator('e3e-process-toolbar')
+      .getByRole('button')
+      .filter({ hasText: 'more_vert' })
+      .first(),
+    'Process toolbar overflow menu',
+  );
+  await stableClick(page.getByRole('menuitem', { name: 'Folder' }), 'Folder menu item');
 
   // Select unit — skip only the unit dropdown when 9100
   if (nxUnit !== '9100') {
@@ -452,7 +490,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
       .locator('#process-folder-unit')
       .getByRole('button')
       .filter({ hasText: 'arrow_drop_down' });
-    await unitDropdownBtn.click();
+    await stableClick(unitDropdownBtn, 'Unit dropdown button');
 
     // Wait for the dropdown panel to be visible before typing
     await page.locator('.mat-autocomplete-panel, mat-option').first()
@@ -467,14 +505,14 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
     // Wait for the filtered option to appear, then click it
     const firstOption = page.locator('mat-option').first();
     await firstOption.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await firstOption.click();
+    await stableClick(firstOption, 'Unit first option');
   }
 
   // Check the Reversal checkbox first, then Reallocate (using stable pendo-id attributes)
   const reversalCheckbox = page
     .locator('[pendo-id="/objects/RcptMaster/rows/attributes/IsReversed"] .mat-checkbox-inner-container');
   await reversalCheckbox.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await reversalCheckbox.click();
+  await stableClick(reversalCheckbox, 'Reversal checkbox');
 
   // Wait for Angular to enable the Reallocate checkbox after Reversal is checked
   await delay(500);
@@ -482,7 +520,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
   const reallocateCheckbox = page
     .locator('[pendo-id="/objects/RcptMaster/rows/attributes/IsReverseAndReallocate"] .mat-checkbox-inner-container');
   await reallocateCheckbox.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await reallocateCheckbox.click();
+  await stableClick(reallocateCheckbox, 'Reallocate checkbox');
 
   // Fill Reverse Date & Reversal Reason using stable field attributes.
   const reverseDateInput = page.locator(
@@ -493,11 +531,11 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
   );
 
   await reverseDateInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await reverseDateInput.click();
+  await stableClick(reverseDateInput, 'Reverse date input');
   await reverseDateInput.fill(rcptDate);
 
   await reverseReasonInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await reverseReasonInput.click();
+  await stableClick(reverseReasonInput, 'Reverse reason input');
   await reverseReasonInput.fill(config.folderDescription);
 
   // Submit the folder update
@@ -537,7 +575,7 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
     .filter({ has: page.locator('div[pendo-id="/objects/RcptMaster/rows/childObjects/RcptInvoice"]') })
     .first();
   await invoicesTab.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  await invoicesTab.click();
+  await stableClick(invoicesTab, 'Invoices tab');
 
   // Remove existing invoices, then add each invoice for this receipt.
   const removeActionsContainer = page
@@ -572,11 +610,11 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
 
         await removeDropdownButton.scrollIntoViewIfNeeded();
         await delay(500);
-        await removeDropdownButton.click();
+        await stableClick(removeDropdownButton, 'Remove dropdown button');
 
         if ((await removeDropdownButton.getAttribute('aria-expanded')) !== 'true') {
           await delay(300);
-          await removeDropdownButton.click({ force: true });
+          await stableClick(removeDropdownButton, 'Remove dropdown button force retry', { forceOnLastRetry: true, retries: 1 });
         }
 
         await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'true', { timeout: 4000 });
@@ -592,8 +630,8 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
         const removeAllMenuItem = activeMenuPanel
           .locator('button[data-automation-id$="/childObjects/RcptInvoice/actions/btnRemoveAll"]')
           .first();
-        await expect(removeAllMenuItem).toBeVisible({ timeout: 3000 });
-        await removeAllMenuItem.click({ timeout: 3000 });
+        await expect(removeAllMenuItem).toBeVisible({ timeout: config.defaultTimeoutMs });
+        await stableClick(removeAllMenuItem, 'Remove All menu item');
 
         await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'false', { timeout: 4000 });
         return;
@@ -614,7 +652,7 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
       .locator('button.child-form-tabs-btn.options-menu')
       .first();
     await childFormOptionsButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await childFormOptionsButton.click();
+    await stableClick(childFormOptionsButton, 'Child form options button');
 
     const invoicesMenuItem = page
       .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[mat-menu-item]')
@@ -628,7 +666,7 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
       .filter({ hasText: /^\s*Add\s*$/ })
       .first();
     await overlayAddMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await overlayAddMenuItem.click();
+    await stableClick(overlayAddMenuItem, 'Invoices Add menu item');
   }
 
   async function openInvoiceSearchDialogFromDirectAddButton(): Promise<void> {
@@ -636,18 +674,18 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
       .locator('button[data-automation-id$="/childObjects/RcptInvoice/actions/AddByQuery"]:visible')
       .first();
     await directAddButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await directAddButton.click();
+    await stableClick(directAddButton, 'Direct Add invoice button');
   }
 
   async function searchAndSelectInvoice(invNumber: string): Promise<void> {
     const addDialogInput = page.locator('input[pendo-id="e3e-quick-find-search-field"]:visible').last();
     await addDialogInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await addDialogInput.click();
+    await stableClick(addDialogInput, 'Add dialog quick-find input');
     await addDialogInput.fill(invNumber);
 
     const searchButton = page.locator('button[pendo-id="e3e-query-dialog-search-button"]');
     await searchButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await searchButton.click();
+    await stableClick(searchButton, 'Invoice dialog Search button');
 
     const firstResultCheckbox = page
       .locator('.ag-center-cols-container .ag-row[row-index="0"] input[type="checkbox"]')
@@ -657,7 +695,7 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
 
     const selectButton = page.locator('button[pendo-id="e3e-query-dialog-select-button"]');
     await selectButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await selectButton.click();
+    await stableClick(selectButton, 'Invoice dialog Select button');
     await page.waitForLoadState('domcontentloaded');
   }
 
@@ -686,14 +724,14 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
   await azurePage.bringToFront();
   await navigateAndWait(azurePage, config.azureRunbookUrl);
 
-  await azurePage.getByRole('button', { name: 'Start' }).click();
+  await stableClick(azurePage.getByRole('button', { name: 'Start' }), 'Azure runbook Start button');
 
   const startFrame = azurePage
     .locator('iframe[name="StartRunbook.ReactView"]')
     .contentFrame();
-  await startFrame.getByRole('textbox', { name: 'Enter a value' }).click();
+  await stableClick(startFrame.getByRole('textbox', { name: 'Enter a value' }), 'Azure runbook parameter input');
   await startFrame.getByRole('textbox', { name: 'Enter a value' }).fill(invoiceIds);
-  await startFrame.getByRole('button', { name: 'Start' }).click();
+  await stableClick(startFrame.getByRole('button', { name: 'Start' }), 'Azure runbook confirm Start button');
 
   // Poll the Job Dashboard by clicking Refresh until status becomes "Completed"
   const jobFrame = azurePage
@@ -703,7 +741,7 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
   const deadline = Date.now() + config.runbookMaxWaitMs;
   while (Date.now() < deadline) {
     // Click Refresh first, then check for status
-    await jobFrame.getByRole('menuitem', { name: 'Refresh' }).click();
+    await stableClick(jobFrame.getByRole('menuitem', { name: 'Refresh' }), 'Azure job Refresh menu item');
     await delay(config.runbookPollingIntervalMs);
 
     const statusText = await jobFrame
