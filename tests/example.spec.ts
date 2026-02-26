@@ -1,4 +1,4 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page, Locator } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
 import { config } from './config';
@@ -170,6 +170,35 @@ function appendToBlackList(
   console.log(`    \u2717 Receipt ${receipt.rcptMasterIndex} added to blacklist`);
 }
 
+  /**
+   * Append all remaining dashboard action-list items to the blacklist file.
+   * Used in final verification when some items could not be submitted.
+   */
+  async function appendRemainingActionListItemsToBlackList(
+    actionListItems: Locator,
+    blackListPath: string,
+  ): Promise<void> {
+    const remainingCount = await actionListItems.count();
+    if (remainingCount === 0) {
+      return;
+    }
+
+    const sections: string[] = [];
+    for (let index = 0; index < remainingCount; index++) {
+      const item = actionListItems.nth(index);
+      const itemText = ((await item.textContent()) ?? '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const header = `# Remaining action-list item ${index + 1}/${remainingCount} — final-step auto-blacklist`;
+      const details = itemText.length > 0 ? itemText : '[No row text captured]';
+      sections.push(`${header}\n${details}`);
+    }
+
+    fs.appendFileSync(blackListPath, sections.join('\n\n') + '\n\n', 'utf-8');
+    console.log(`    ✗ Added ${remainingCount} remaining action-list item(s) to blacklist`);
+  }
+
 /**
  * After submitting in Phase 1, poll for either:
  *  - Receipt Master Index becoming <AUTO> \u2192 success, or
@@ -209,7 +238,7 @@ async function waitForSubmitResult(
       }
     } catch { /* no popup */ }
 
-    await delay(1000);
+    await delay(500);
   }
 
   return {
@@ -243,7 +272,7 @@ async function waitForPhase3SubmitResult(
       }
     } catch { /* */ }
 
-    await delay(1000);
+    await delay(500);
   }
 
   return { success: false, popupMessage: 'Timed out waiting for Phase 3 submit' };
@@ -255,6 +284,40 @@ async function waitForPhase3SubmitResult(
  */
 async function navigateAndWait(page: Page, url: string): Promise<void> {
   await page.goto(url, { waitUntil: 'networkidle', timeout: config.navigationTimeoutMs });
+}
+
+/**
+ * Open the oldest action-list item without triggering Playwright's auto-scroll loop.
+ * Uses DOM click first (no auto-scroll), then a force-click fallback.
+ */
+async function openOldestActionListItem(page: Page, actionListItems: Locator): Promise<void> {
+  const oldestRow = actionListItems.last();
+  const oldestRowContent = oldestRow.locator('.action-list-item-content').first();
+  const formRenderer = page.locator('e3e-form-renderer');
+
+  await expect(oldestRow).toBeVisible({ timeout: config.navigationTimeoutMs });
+
+  const clickTargets: Locator[] = [oldestRowContent, oldestRow];
+  for (const target of clickTargets) {
+    try {
+      if (!(await target.isVisible())) {
+        continue;
+      }
+
+      await target.evaluate((element) => {
+        const htmlElement = element as HTMLElement;
+        htmlElement.click();
+      });
+
+      await expect(formRenderer).toBeVisible({ timeout: 7000 });
+      return;
+    } catch {
+      // Try the next target/fallback path
+    }
+  }
+
+  await oldestRow.click({ force: true, timeout: 5000 });
+  await expect(formRenderer).toBeVisible({ timeout: config.navigationTimeoutMs });
 }
 
 /**
@@ -379,7 +442,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
     await unitFilterInput.fill(nxUnit);
 
     // Give Angular time to filter the dropdown options after typing
-    await delay(1000);
+    await delay(500);
 
     // Wait for the filtered option to appear, then click it
     const firstOption = page.locator('mat-option').first();
@@ -394,7 +457,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
   await reversalCheckbox.click();
 
   // Wait for Angular to enable the Reallocate checkbox after Reversal is checked
-  await delay(1000);
+  await delay(500);
 
   const reallocateCheckbox = page
     .locator('[pendo-id="/objects/RcptMaster/rows/attributes/IsReverseAndReallocate"] .mat-checkbox-inner-container');
@@ -676,7 +739,7 @@ async function submitOpenedReceipts(
     }
 
     // Allow the action list to fully render
-    await delay(2000);
+    await delay(500);
 
     const count = await actionListItems.count();
     if (count === 0) {
@@ -703,12 +766,7 @@ async function submitOpenedReceipts(
     await expect(actionListItems.first()).toBeVisible({ timeout: config.navigationTimeoutMs });
 
     // Open the oldest item (last in the list)
-    const oldestItemContent = actionListItems.last().locator('.action-list-item-content').first();
-    await oldestItemContent.scrollIntoViewIfNeeded();
-    await expect(oldestItemContent).toBeVisible({ timeout: config.navigationTimeoutMs });
-    await oldestItemContent.click();
-    await page.waitForLoadState('domcontentloaded');
-    await expect(page.locator('e3e-form-renderer')).toBeVisible({ timeout: config.navigationTimeoutMs });
+    await openOldestActionListItem(page, actionListItems);
 
     // Update invoices if we still have a matching receipt group in the queue
     let currentReceipt: ReceiptGroup | null = null;
@@ -757,13 +815,14 @@ async function submitOpenedReceipts(
 
   // Final verification: navigate to dashboard and check the action list
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
-  await delay(2000);
+  await delay(500);
   const remainingCount = await actionListItems.count();
   if (remainingCount > 0) {
     console.log(
       `  \u26a0 Action list still has ${remainingCount} item(s) after ${submitted} submission(s). ` +
       `These may be blacklisted receipts requiring manual intervention.`,
     );
+      await appendRemainingActionListItemsToBlackList(actionListItems, blackListPath);
   } else {
     console.log(`  \u2713 Verified: action list is empty after submitting ${submitted} process(es)`);
   }
