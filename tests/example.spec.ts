@@ -163,11 +163,31 @@ function appendToBlackList(
   blackListPath: string,
   receipt: ReceiptGroup,
   popupMessage: string,
+  relatedReversedReceiptIndex?: string | null,
 ): void {
   const header = `# Receipt ${receipt.rcptMasterIndex} \u2014 ${popupMessage}\n`;
+  const reversedReceiptLine = relatedReversedReceiptIndex
+    ? `# Related reversed receipt index: ${relatedReversedReceiptIndex}\n`
+    : '';
   const lines = receipt.rawLines.join('\n');
-  fs.appendFileSync(blackListPath, header + lines + '\n\n', 'utf-8');
+  fs.appendFileSync(blackListPath, header + reversedReceiptLine + lines + '\n\n', 'utf-8');
   console.log(`    \u2717 Receipt ${receipt.rcptMasterIndex} added to blacklist`);
+}
+
+async function getCurrentReceiptIndex(page: Page): Promise<string | null> {
+  const rcptIndexLocator = page
+    .locator('[data-automation-id$="/attributes/RcptIndex"]')
+    .first();
+
+  try {
+    await rcptIndexLocator.waitFor({ state: 'visible', timeout: 5000 });
+    const text = ((await rcptIndexLocator.textContent()) ?? '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
 }
 
   /**
@@ -778,6 +798,8 @@ async function submitOpenedReceipts(
       console.log(`    \u25b9 Extra action list item (no matching receipt group) \u2014 submitting without invoice changes`);
     }
 
+    const openedReversedReceiptIndex = await getCurrentReceiptIndex(page);
+
     // Submit the receipt
     await clickSubmitAction(page);
 
@@ -785,21 +807,29 @@ async function submitOpenedReceipts(
     const phase3Result = await waitForPhase3SubmitResult(page);
     if (!phase3Result.success) {
       const msg = phase3Result.popupMessage ?? '';
-      const isMatterBlocked = msg.includes('Matter does not allow payment activity. Receipt cannot be reversed.');
+      const relatedReversedReceiptIndex =
+        (await getCurrentReceiptIndex(page)) ?? openedReversedReceiptIndex;
 
       console.log(`    \u26a0 Popup detected after Phase 3 submit: ${msg}`);
       await dismissPopup(page);
 
-      // Only blacklist if the error is the specific matter-blocked message
-      if (isMatterBlocked) {
-        if (currentReceipt) {
-          appendToBlackList(blackListPath, currentReceipt, msg);
-        } else {
-          fs.appendFileSync(blackListPath, `# Unknown receipt \u2014 ${msg}\n\n`, 'utf-8');
-          console.log('    \u2717 Unknown receipt added to blacklist');
-        }
+      if (currentReceipt) {
+        appendToBlackList(
+          blackListPath,
+          currentReceipt,
+          `Phase 3 submit failure \u2014 ${msg}`,
+          relatedReversedReceiptIndex,
+        );
       } else {
-        console.log(`    \u2139 Non-blacklist popup — skipping blacklist for this item`);
+        const reversedReceiptLine = relatedReversedReceiptIndex
+          ? `# Related reversed receipt index: ${relatedReversedReceiptIndex}\n`
+          : '';
+        fs.appendFileSync(
+          blackListPath,
+          `# Unknown receipt \u2014 Phase 3 submit failure \u2014 ${msg}\n${reversedReceiptLine}\n`,
+          'utf-8',
+        );
+        console.log('    \u2717 Unknown receipt added to blacklist');
       }
 
       // Do NOT cancel in Phase 3 — go to dashboard and continue
