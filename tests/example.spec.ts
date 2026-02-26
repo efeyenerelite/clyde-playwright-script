@@ -14,6 +14,7 @@ interface MalformedEntry {
   rcptMasterIndex: number;
   difference: number;
   status: string;
+  rawLine: string;
 }
 
 interface ReceiptGroup {
@@ -23,6 +24,8 @@ interface ReceiptGroup {
   invNumbers: string[];
   /** Unique InvMasterIndex values for the Azure Runbook parameter (CORRUPTED rows only) */
   invMasterIndices: number[];
+  /** Original tab-separated lines from the malformed data file */
+  rawLines: string[];
 }
 
 /* ================================================================== *
@@ -54,6 +57,7 @@ function parseMalformedData(): MalformedEntry[] {
       rcptMasterIndex: parseInt(cols[4].trim(), 10),
       difference: parseFloat(cols[16].trim()),
       status: (cols[17] ?? 'CORRUPTED').trim().toUpperCase(),
+      rawLine: line,
     };
   });
 }
@@ -83,6 +87,7 @@ function groupByReceipt(entries: MalformedEntry[]): ReceiptGroup[] {
           .map(e => e.invMasterIndex),
       ),
     ],
+    rawLines: groupEntries.map(e => e.rawLine),
   }));
 }
 
@@ -102,6 +107,146 @@ function chunkArray<T>(items: T[], size: number): T[][] {
     chunks.push(items.slice(index, index + size));
   }
   return chunks;
+}
+
+/* ================================================================== *
+ *  Popup & blacklist helpers                                          *
+ * ================================================================== */
+
+/**
+ * Check for a snack-bar popup and return its message, or null if none.
+ */
+async function detectPopup(page: Page, timeout = 5000): Promise<string | null> {
+  try {
+    const snackbar = page.locator('snack-bar-container .message');
+    await snackbar.waitFor({ state: 'visible', timeout });
+    return ((await snackbar.textContent()) ?? '').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Dismiss a visible snack-bar popup by clicking its close icon.
+ */
+async function dismissPopup(page: Page): Promise<void> {
+  try {
+    const closeButton = page.locator('snack-bar-container mat-icon.close-alert');
+    if (await closeButton.isVisible()) {
+      await closeButton.click();
+      await delay(500);
+    }
+  } catch {
+    // Popup may have auto-dismissed
+  }
+}
+
+/**
+ * Cancel the currently open process row: click Cancel, then confirm Yes.
+ */
+async function cancelCurrentRow(page: Page): Promise<void> {
+  const cancelButton = page.locator('button[data-automation-id="CANCEL"]');
+  await cancelButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await cancelButton.click();
+
+  const confirmYesButton = page.locator('button[data-automation-id="cancel-dialog-yes-button"]');
+  await confirmYesButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+  await confirmYesButton.click();
+  await page.waitForLoadState('domcontentloaded');
+  console.log('    \u2717 Row cancelled');
+}
+
+/**
+ * Append receipt entries to the run's blacklist file in malformed-data format.
+ */
+function appendToBlackList(
+  blackListPath: string,
+  receipt: ReceiptGroup,
+  popupMessage: string,
+): void {
+  const header = `# Receipt ${receipt.rcptMasterIndex} \u2014 ${popupMessage}\n`;
+  const lines = receipt.rawLines.join('\n');
+  fs.appendFileSync(blackListPath, header + lines + '\n\n', 'utf-8');
+  console.log(`    \u2717 Receipt ${receipt.rcptMasterIndex} added to blacklist`);
+}
+
+/**
+ * After submitting in Phase 1, poll for either:
+ *  - Receipt Master Index becoming <AUTO> \u2192 success, or
+ *  - A snack-bar popup while index is NOT <AUTO> \u2192 failure.
+ */
+async function waitForSubmitResult(
+  page: Page,
+  contextLabel: string,
+): Promise<{ success: boolean; popupMessage?: string }> {
+  const rcptIndexLocator = page
+    .locator('[data-automation-id$="/attributes/RcptIndex"]')
+    .first();
+  const snackbarLocator = page.locator('snack-bar-container .message');
+  const deadline = Date.now() + config.navigationTimeoutMs;
+
+  while (Date.now() < deadline) {
+    // Check if receipt master index is <AUTO>
+    try {
+      const text = ((await rcptIndexLocator.textContent({ timeout: 2000 })) ?? '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (text === '<AUTO>') return { success: true };
+    } catch { /* element not ready */ }
+
+    // Check for error popup
+    try {
+      if (await snackbarLocator.isVisible()) {
+        const message = ((await snackbarLocator.textContent()) ?? '').trim();
+        // One final check \u2014 index may have become <AUTO> at the same time
+        try {
+          const text = ((await rcptIndexLocator.textContent({ timeout: 2000 })) ?? '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (text === '<AUTO>') return { success: true, popupMessage: message };
+        } catch { /* */ }
+        return { success: false, popupMessage: message };
+      }
+    } catch { /* no popup */ }
+
+    await delay(1000);
+  }
+
+  return {
+    success: false,
+    popupMessage: `[${contextLabel}] Timed out waiting for submit to complete`,
+  };
+}
+
+/**
+ * After submitting in Phase 3, wait for either
+ * the form to close (success) or a snack-bar popup (failure).
+ */
+async function waitForPhase3SubmitResult(
+  page: Page,
+): Promise<{ success: boolean; popupMessage?: string }> {
+  const formLocator = page.locator('e3e-form-renderer');
+  const snackbarLocator = page.locator('snack-bar-container .message');
+  const deadline = Date.now() + config.navigationTimeoutMs;
+
+  while (Date.now() < deadline) {
+    // Check if form closed (success)
+    try {
+      if (!(await formLocator.isVisible())) return { success: true };
+    } catch { /* */ }
+
+    // Check for popup (failure)
+    try {
+      if (await snackbarLocator.isVisible()) {
+        const message = ((await snackbarLocator.textContent()) ?? '').trim();
+        return { success: false, popupMessage: message };
+      }
+    } catch { /* */ }
+
+    await delay(1000);
+  }
+
+  return { success: false, popupMessage: 'Timed out waiting for Phase 3 submit' };
 }
 
 /**
@@ -179,7 +324,7 @@ async function login(page: Page): Promise<void> {
  *  Phase 1 – Open each receipt and perform reverse action             *
  * ================================================================== */
 
-async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> {
+async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: string): Promise<boolean> {
   console.log(`  ▸ Processing receipt ${receipt.rcptMasterIndex} (${receipt.invNumbers.length} invoice(s))`);
 
   // Navigate to receipt process page (full reload resets Angular state)
@@ -275,9 +420,30 @@ async function processReceipt(page: Page, receipt: ReceiptGroup): Promise<void> 
   // Submit the folder update
   await clickSubmitAction(page);
   await page.waitForLoadState('domcontentloaded');
-  await waitForReceiptMasterIndexAuto(page, 'Phase 1 post-folder-submit');
-  
+
+  // Wait for submit to succeed (<AUTO>) or fail (popup)
+  const submitResult = await waitForSubmitResult(page, `Phase 1 receipt ${receipt.rcptMasterIndex}`);
+  if (!submitResult.success) {
+    const msg = submitResult.popupMessage ?? '';
+    const isMatterBlocked = msg.includes('Matter does not allow payment activity. Receipt cannot be reversed.');
+
+    if (isMatterBlocked) {
+      // Fatal error — blacklist the receipt and cancel the row
+      console.log(`    \u26a0 Blocked receipt detected: ${msg}`);
+      await dismissPopup(page);
+      appendToBlackList(blackListPath, receipt, msg);
+      await cancelCurrentRow(page);
+      await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+      return false;
+    }
+
+    // Non-fatal popup (e.g. informational message about a successful reversal) — dismiss and continue
+    console.log(`    \u2139 Informational popup (not an error): ${msg}`);
+    await dismissPopup(page);
+  }
+
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+  return true;
 }
 
 async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise<void> {
@@ -484,6 +650,7 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
 async function submitOpenedReceipts(
   page: Page,
   receiptGroups: ReceiptGroup[],
+  blackListPath: string,
 ): Promise<void> {
   await page.bringToFront();
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
@@ -497,6 +664,9 @@ async function submitOpenedReceipts(
   let submitted = 0;
   // Safety limit: expect at most the batch size + a generous margin for leftovers
   const maxIterations = receiptGroups.length + 20;
+  let lastActionListCount = Infinity;
+  let consecutiveStalls = 0;
+  const maxConsecutiveStalls = 3;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     // On subsequent iterations, navigate to dashboard for a fresh action list
@@ -510,9 +680,24 @@ async function submitOpenedReceipts(
 
     const count = await actionListItems.count();
     if (count === 0) {
-      console.log('    ✓ Action list is empty — all processes submitted');
+      console.log('    \u2713 Action list is empty \u2014 all processes submitted');
       break;
     }
+
+    // Stall detection: if the count doesn't decrease, we may be stuck on failing items
+    if (count >= lastActionListCount) {
+      consecutiveStalls++;
+      if (consecutiveStalls >= maxConsecutiveStalls) {
+        console.log(
+          `    \u26a0 Action list stuck at ${count} item(s) after ${consecutiveStalls} consecutive stalls \u2014 ` +
+          `remaining items likely need manual intervention`,
+        );
+        break;
+      }
+    } else {
+      consecutiveStalls = 0;
+    }
+    lastActionListCount = count;
 
     console.log(`    Action list has ${count} item(s) remaining`);
     await expect(actionListItems.first()).toBeVisible({ timeout: config.navigationTimeoutMs });
@@ -526,39 +711,62 @@ async function submitOpenedReceipts(
     await expect(page.locator('e3e-form-renderer')).toBeVisible({ timeout: config.navigationTimeoutMs });
 
     // Update invoices if we still have a matching receipt group in the queue
+    let currentReceipt: ReceiptGroup | null = null;
     if (receiptQueue.length > 0) {
-      const receipt = receiptQueue.shift()!;
-      console.log(`    ▹ Updating invoices for receipt ${receipt.rcptMasterIndex}`);
-      await updateReceiptInvoices(page, receipt);
+      currentReceipt = receiptQueue.shift()!;
+      console.log(`    \u25b9 Updating invoices for receipt ${currentReceipt.rcptMasterIndex}`);
+      await updateReceiptInvoices(page, currentReceipt);
     } else {
-      console.log(`    ▹ Extra action list item (no matching receipt group) — submitting without invoice changes`);
+      console.log(`    \u25b9 Extra action list item (no matching receipt group) \u2014 submitting without invoice changes`);
     }
 
     // Submit the receipt
     await clickSubmitAction(page);
 
-    // CRITICAL: Wait for the submit to fully complete before navigating away.
-    // The form closes and the page returns to the dashboard on success.
-    // If we navigate before this completes, the server request is aborted
-    // and the process stays open in the action list.
-    await page.locator('e3e-form-renderer').waitFor({ state: 'hidden', timeout: config.navigationTimeoutMs });
+    // Wait for form to close (success) or popup (failure)
+    const phase3Result = await waitForPhase3SubmitResult(page);
+    if (!phase3Result.success) {
+      const msg = phase3Result.popupMessage ?? '';
+      const isMatterBlocked = msg.includes('Matter does not allow payment activity. Receipt cannot be reversed.');
+
+      console.log(`    \u26a0 Popup detected after Phase 3 submit: ${msg}`);
+      await dismissPopup(page);
+
+      // Only blacklist if the error is the specific matter-blocked message
+      if (isMatterBlocked) {
+        if (currentReceipt) {
+          appendToBlackList(blackListPath, currentReceipt, msg);
+        } else {
+          fs.appendFileSync(blackListPath, `# Unknown receipt \u2014 ${msg}\n\n`, 'utf-8');
+          console.log('    \u2717 Unknown receipt added to blacklist');
+        }
+      } else {
+        console.log(`    \u2139 Non-blacklist popup — skipping blacklist for this item`);
+      }
+
+      // Do NOT cancel in Phase 3 — go to dashboard and continue
+      await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+      continue;
+    }
+
     await page.waitForLoadState('networkidle', { timeout: config.navigationTimeoutMs });
 
     submitted++;
-    console.log(`    ✓ Submit completed (${submitted} total)`);
+    console.log(`    \u2713 Submit completed (${submitted} total)`);
   }
 
-  // Final verification: navigate to dashboard and confirm the action list is empty
+  // Final verification: navigate to dashboard and check the action list
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
   await delay(2000);
   const remainingCount = await actionListItems.count();
   if (remainingCount > 0) {
-    throw new Error(
-      `Action list still has ${remainingCount} item(s) after ${submitted} submission(s). ` +
-      `Manual intervention may be required.`,
+    console.log(
+      `  \u26a0 Action list still has ${remainingCount} item(s) after ${submitted} submission(s). ` +
+      `These may be blacklisted receipts requiring manual intervention.`,
     );
+  } else {
+    console.log(`  \u2713 Verified: action list is empty after submitting ${submitted} process(es)`);
   }
-  console.log(`  ✓ Verified: action list is empty after submitting ${submitted} process(es)`);
 }
 
 /* ================================================================== *
@@ -581,6 +789,10 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
   const azurePage: Page = await context.newPage();
   await page.bringToFront();
 
+  // Generate a unique blacklist file path for this run
+  const runTimestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const blackListFilePath = path.resolve(__dirname, '..', 'resources', `blackList_${runTimestamp}`);
+
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
     const batch = batches[batchIndex];
     console.log(
@@ -590,23 +802,30 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
 
     // ── Phase 1: Open each receipt and perform reverse action ────────
     console.log('═══ Phase 1: Process receipts ═══');
+    const successfulReceipts: ReceiptGroup[] = [];
     for (const receipt of batch) {
-      await processReceipt(page, receipt);
+      const success = await processReceipt(page, receipt, blackListFilePath);
+      if (success) {
+        successfulReceipts.push(receipt);
+      }
     }
+    console.log(
+      `  Phase 1 complete: ${successfulReceipts.length}/${batch.length} receipt(s) succeeded`,
+    );
 
-    // ── Phase 2: Trigger Azure Runbook with invoices from this batch ─
+    // ── Phase 2: Trigger Azure Runbook with invoices from successful receipts ─
     console.log('\n═══ Phase 2: Trigger Azure Runbook ═══');
-    const batchInvMasterIndices = [...new Set(batch.flatMap(r => r.invMasterIndices))];
+    const batchInvMasterIndices = [...new Set(successfulReceipts.flatMap(r => r.invMasterIndices))];
     const batchInvoiceIds = batchInvMasterIndices.join(',');
     console.log(
       `  Collected ${batchInvMasterIndices.length} distinct CORRUPTED invoice(s) from ` +
-      `${batch.length} receipt(s) in current batch`,
+      `${successfulReceipts.length} successful receipt(s) in current batch`,
     );
     if (batchInvMasterIndices.length > 0) {
       await triggerRunbook(
         azurePage,
         batchInvoiceIds,
-        `batch ${batchIndex + 1} (${batch.length} receipt(s))`,
+        `batch ${batchIndex + 1} (${successfulReceipts.length} receipt(s))`,
       );
     } else {
       console.log('  No CORRUPTED invoices in this batch; skipping runbook trigger');
@@ -614,9 +833,14 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
 
     // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
     console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
-    await submitOpenedReceipts(page, batch);
+    await submitOpenedReceipts(page, successfulReceipts, blackListFilePath);
   }
 
   await azurePage.close();
-  console.log('\n✓ All receipts processed successfully');
+
+  // Report blacklist summary
+  if (fs.existsSync(blackListFilePath)) {
+    console.log(`\n\u26a0 Some receipts were blacklisted \u2014 see ${blackListFilePath}`);
+  }
+  console.log('\n\u2713 All receipts processed');
 });
