@@ -157,6 +157,23 @@ async function cancelCurrentRow(page: Page): Promise<void> {
 }
 
 /**
+ * Append receipt entries to the run's whitelist file on successful submission.
+ */
+function appendToWhiteList(
+  whiteListPath: string,
+  receipt: ReceiptGroup,
+  reversedReceiptIndex?: string | null,
+): void {
+  const header = `# Receipt ${receipt.rcptMasterIndex} — SUBMITTED SUCCESSFULLY\n`;
+  const reversedReceiptLine = reversedReceiptIndex
+    ? `# Reversed receipt index: ${reversedReceiptIndex}\n`
+    : '';
+  const lines = receipt.rawLines.join('\n');
+  fs.appendFileSync(whiteListPath, header + reversedReceiptLine + lines + '\n\n', 'utf-8');
+  console.log(`    ✓ Receipt ${receipt.rcptMasterIndex} added to whitelist`);
+}
+
+/**
  * Append receipt entries to the run's blacklist file in malformed-data format.
  */
 function appendToBlackList(
@@ -772,6 +789,7 @@ async function submitOpenedReceipts(
   page: Page,
   receiptGroups: ReceiptGroup[],
   blackListPath: string,
+  whiteListPath: string,
 ): Promise<void> {
   await page.bringToFront();
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
@@ -877,6 +895,20 @@ async function submitOpenedReceipts(
 
     await page.waitForLoadState('networkidle', { timeout: config.navigationTimeoutMs });
 
+    if (currentReceipt) {
+      appendToWhiteList(whiteListPath, currentReceipt, openedReversedReceiptIndex);
+    } else {
+      const reversedLine = openedReversedReceiptIndex
+        ? `# Reversed receipt index: ${openedReversedReceiptIndex}\n`
+        : '';
+      fs.appendFileSync(
+        whiteListPath,
+        `# Unknown receipt — submitted successfully (no matching receipt group)\n${reversedLine}\n`,
+        'utf-8',
+      );
+      console.log('    ✓ Unknown receipt added to whitelist');
+    }
+
     submitted++;
     console.log(`    \u2713 Submit completed (${submitted} total)`);
   }
@@ -919,6 +951,7 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
   // Generate a unique blacklist file path for this run
   const runTimestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const blackListFilePath = path.resolve(__dirname, '..', 'resources', `blackList_${runTimestamp}`);
+  const whiteListFilePath = path.resolve(__dirname, '..', 'resources', `whiteList_${runTimestamp}`);
 
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
     const batch = batches[batchIndex];
@@ -960,12 +993,15 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
 
     // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
     console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
-    await submitOpenedReceipts(page, successfulReceipts, blackListFilePath);
+    await submitOpenedReceipts(page, successfulReceipts, blackListFilePath, whiteListFilePath);
   }
 
   await azurePage.close();
 
-  // Report blacklist summary
+  // Report whitelist / blacklist summary
+  if (fs.existsSync(whiteListFilePath)) {
+    console.log(`\n\u2713 Successfully submitted receipts recorded \u2014 see ${whiteListFilePath}`);
+  }
   if (fs.existsSync(blackListFilePath)) {
     console.log(`\n\u26a0 Some receipts were blacklisted \u2014 see ${blackListFilePath}`);
   }
