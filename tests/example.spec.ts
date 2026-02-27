@@ -207,6 +207,18 @@ async function getCurrentReceiptIndex(page: Page): Promise<string | null> {
   }
 }
 
+/**
+ * Parse the processId (GUID) from a 3E process URL.
+ * Example input:  https://…/process/f840306f-4bed-45d9-a40d-5e76bbd55d8e#RcptMaster
+ * Example output: f840306f-4bed-45d9-a40d-5e76bbd55d8e
+ */
+function parseProcessIdFromUrl(url: string): string | null {
+  const match = url.match(
+    /\/process\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+  );
+  return match ? match[1] : null;
+}
+
   /**
    * Append all remaining dashboard action-list items to the blacklist file.
    * Used in final verification when some items could not be submitted.
@@ -459,7 +471,11 @@ async function login(page: Page): Promise<void> {
  *  Phase 1 – Open each receipt and perform reverse action             *
  * ================================================================== */
 
-async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: string): Promise<boolean> {
+async function processReceipt(
+  page: Page,
+  receipt: ReceiptGroup,
+  blackListPath: string,
+): Promise<{ success: boolean; processId: string | null }> {
   console.log(`  ▸ Processing receipt ${receipt.rcptMasterIndex} (${receipt.invNumbers.length} invoice(s))`);
 
   // Navigate to receipt process page (full reload resets Angular state)
@@ -572,7 +588,7 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
       appendToBlackList(blackListPath, receipt, msg);
       await cancelCurrentRow(page);
       await navigateAndWait(page, `${config.baseUrl}/dashboard`);
-      return false;
+      return { success: false, processId: null };
     }
 
     // Non-fatal popup (e.g. informational message about a successful reversal) — dismiss and continue
@@ -580,8 +596,34 @@ async function processReceipt(page: Page, receipt: ReceiptGroup, blackListPath: 
     await dismissPopup(page);
   }
 
+  // Navigate to dashboard, then open the top (newest) action list item to capture the processId
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
-  return true;
+
+  let processId: string | null = null;
+  try {
+    const actionListItems = page.locator('e3e-dashboard-action-list-panel ul.action-list-items li');
+    await actionListItems.first().waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+
+    // The newest/top item is the reversed receipt just created — click it to get its URL
+    const newestRow = actionListItems.first();
+    const newestRowContent = newestRow.locator('.action-list-item-content').first();
+    await newestRowContent.evaluate((el) => (el as HTMLElement).click());
+    await page.locator('e3e-form-renderer').waitFor({ state: 'visible', timeout: config.defaultTimeoutMs });
+
+    processId = parseProcessIdFromUrl(page.url());
+    if (processId) {
+      console.log(`    \u2713 Captured process ID from top action list item: ${processId}`);
+    } else {
+      console.log(`    \u26a0 Could not parse process ID from URL: ${page.url()}`);
+    }
+
+    // Navigate back to dashboard without submitting anything
+    await navigateAndWait(page, `${config.baseUrl}/dashboard`);
+  } catch {
+    console.log(`    \u26a0 Could not capture process ID from action list`);
+  }
+
+  return { success: true, processId };
 }
 
 async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise<void> {
@@ -787,7 +829,7 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
 
 async function submitOpenedReceipts(
   page: Page,
-  receiptGroups: ReceiptGroup[],
+  processIdMap: Map<string, ReceiptGroup>,
   blackListPath: string,
   whiteListPath: string,
 ): Promise<void> {
@@ -797,12 +839,12 @@ async function submitOpenedReceipts(
   const actionListItems = page.locator('e3e-dashboard-action-list-panel ul.action-list-items li');
   console.log(`  ▸ Draining all opened processes from action list`);
 
-  // Queue of receipt groups whose invoices still need updating.
-  // Items beyond the queue (leftover from previous runs) are submitted as-is.
-  const receiptQueue = [...receiptGroups];
+  // Safety limit: at most one iteration per mapped receipt plus a margin for leftovers.
+  const maxIterations = processIdMap.size + 20;
   let submitted = 0;
-  // Safety limit: expect at most the batch size + a generous margin for leftovers
-  const maxIterations = receiptGroups.length + 20;
+  // Track process IDs we have already written to the blacklist to prevent duplicate entries
+  // when the same failing item is encountered on successive loop iterations.
+  const blacklistedProcessIds = new Set<string>();
   let lastActionListCount = Infinity;
   let consecutiveStalls = 0;
   const maxConsecutiveStalls = 3;
@@ -844,14 +886,19 @@ async function submitOpenedReceipts(
     // Open the oldest item (last in the list)
     await openOldestActionListItem(page, actionListItems);
 
-    // Update invoices if we still have a matching receipt group in the queue
+    // Match the opened process to a receipt group via URL processId lookup
+    const currentUrl = page.url();
+    const currentProcessId = parseProcessIdFromUrl(currentUrl);
     let currentReceipt: ReceiptGroup | null = null;
-    if (receiptQueue.length > 0) {
-      currentReceipt = receiptQueue.shift()!;
-      console.log(`    \u25b9 Updating invoices for receipt ${currentReceipt.rcptMasterIndex}`);
+
+    if (currentProcessId && processIdMap.has(currentProcessId)) {
+      currentReceipt = processIdMap.get(currentProcessId)!;
+      console.log(`    \u25b9 Matched process ${currentProcessId} \u2192 receipt ${currentReceipt.rcptMasterIndex}`);
       await updateReceiptInvoices(page, currentReceipt);
     } else {
-      console.log(`    \u25b9 Extra action list item (no matching receipt group) \u2014 submitting without invoice changes`);
+      console.log(
+        `    \u25b9 No matching receipt found for process ${currentProcessId ?? '(no GUID in URL)'} \u2014 submitting without invoice changes`,
+      );
     }
 
     const openedReversedReceiptIndex = await getCurrentReceiptIndex(page);
@@ -869,23 +916,31 @@ async function submitOpenedReceipts(
       console.log(`    \u26a0 Popup detected after Phase 3 submit: ${msg}`);
       await dismissPopup(page);
 
-      if (currentReceipt) {
-        appendToBlackList(
-          blackListPath,
-          currentReceipt,
-          `Phase 3 submit failure \u2014 ${msg}`,
-          relatedReversedReceiptIndex,
-        );
+      const alreadyBlacklisted = !!currentProcessId && blacklistedProcessIds.has(currentProcessId);
+
+      if (alreadyBlacklisted) {
+        console.log(`    ↷ Process ${currentProcessId} already blacklisted — skipping duplicate entry`);
       } else {
-        const reversedReceiptLine = relatedReversedReceiptIndex
-          ? `# Related reversed receipt index: ${relatedReversedReceiptIndex}\n`
-          : '';
-        fs.appendFileSync(
-          blackListPath,
-          `# Unknown receipt \u2014 Phase 3 submit failure \u2014 ${msg}\n${reversedReceiptLine}\n`,
-          'utf-8',
-        );
-        console.log('    \u2717 Unknown receipt added to blacklist');
+        if (currentProcessId) blacklistedProcessIds.add(currentProcessId);
+
+        if (currentReceipt) {
+          appendToBlackList(
+            blackListPath,
+            currentReceipt,
+            `Phase 3 submit failure \u2014 ${msg}`,
+            relatedReversedReceiptIndex,
+          );
+        } else {
+          const reversedReceiptLine = relatedReversedReceiptIndex
+            ? `# Related reversed receipt index: ${relatedReversedReceiptIndex}\n`
+            : '';
+          fs.appendFileSync(
+            blackListPath,
+            `# Unknown receipt \u2014 Phase 3 submit failure \u2014 ${msg}\n${reversedReceiptLine}\n`,
+            'utf-8',
+          );
+          console.log('    \u2717 Unknown receipt added to blacklist');
+        }
       }
 
       // Do NOT cancel in Phase 3 — go to dashboard and continue
@@ -963,10 +1018,17 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
     // ── Phase 1: Open each receipt and perform reverse action ────────
     console.log('═══ Phase 1: Process receipts ═══');
     const successfulReceipts: ReceiptGroup[] = [];
+    const processIdMap = new Map<string, ReceiptGroup>();
     for (const receipt of batch) {
-      const success = await processReceipt(page, receipt, blackListFilePath);
-      if (success) {
+      const result = await processReceipt(page, receipt, blackListFilePath);
+      if (result.success) {
         successfulReceipts.push(receipt);
+        if (result.processId) {
+          processIdMap.set(result.processId, receipt);
+          console.log(`  ↳ Mapped process ${result.processId} → receipt ${receipt.rcptMasterIndex}`);
+        } else {
+          console.log(`  ⚠ Receipt ${receipt.rcptMasterIndex} succeeded but no process ID captured — will not be matched in Phase 3`);
+        }
       }
     }
     console.log(
@@ -993,7 +1055,7 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
 
     // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
     console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
-    await submitOpenedReceipts(page, successfulReceipts, blackListFilePath, whiteListFilePath);
+    await submitOpenedReceipts(page, processIdMap, blackListFilePath, whiteListFilePath);
   }
 
   await azurePage.close();
