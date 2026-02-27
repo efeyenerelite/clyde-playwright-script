@@ -96,9 +96,10 @@ for (const comp of sortedComponents) {
   }
 }
 
-// Split into two groups, trying to balance the total number of lines
-let group1Lines = 0, group2Lines = 0;
-const group1Receipts = new Set(), group2Receipts = new Set();
+// Split into 3 groups, trying to balance the total number of lines
+const NUM_GROUPS = 3;
+const groupLines = Array(NUM_GROUPS).fill(0);
+const groupReceipts = Array.from({ length: NUM_GROUPS }, () => new Set());
 
 // Sort components by total line count descending for better balancing
 const compWithSize = sortedComponents.map(comp => ({
@@ -108,52 +109,50 @@ const compWithSize = sortedComponents.map(comp => ({
 compWithSize.sort((a, b) => b.lineCount - a.lineCount);
 
 for (const comp of compWithSize) {
-  if (group1Lines <= group2Lines) {
-    for (const r of comp.receipts) group1Receipts.add(r);
-    group1Lines += comp.lineCount;
-  } else {
-    for (const r of comp.receipts) group2Receipts.add(r);
-    group2Lines += comp.lineCount;
+  // Find the group with the fewest lines
+  let minIdx = 0;
+  for (let i = 1; i < NUM_GROUPS; i++) {
+    if (groupLines[i] < groupLines[minIdx]) minIdx = i;
+  }
+  for (const r of comp.receipts) groupReceipts[minIdx].add(r);
+  groupLines[minIdx] += comp.lineCount;
+}
+
+for (let i = 0; i < NUM_GROUPS; i++) {
+  console.log(`\nGroup ${i + 1}: ${groupReceipts[i].size} receipts, ${groupLines[i]} lines`);
+}
+
+// Verify no overlap in receipts and invoices between any pair
+for (let i = 0; i < NUM_GROUPS; i++) {
+  for (let j = i + 1; j < NUM_GROUPS; j++) {
+    const rcptOverlap = [...groupReceipts[i]].filter(r => groupReceipts[j].has(r));
+    console.log(`Receipt overlap (Group ${i+1} & ${j+1}): ${rcptOverlap.length}`);
+
+    const invI = new Set(), invJ = new Set();
+    for (const r of groupReceipts[i]) for (const inv of rcptMap.get(r).invMasters) invI.add(inv);
+    for (const r of groupReceipts[j]) for (const inv of rcptMap.get(r).invMasters) invJ.add(inv);
+    const invOverlap = [...invI].filter(inv => invJ.has(inv));
+    console.log(`Invoice overlap (Group ${i+1} & ${j+1}): ${invOverlap.length}`);
   }
 }
 
-console.log(`\nGroup 1: ${group1Receipts.size} receipts, ${group1Lines} lines`);
-console.log(`Group 2: ${group2Receipts.size} receipts, ${group2Lines} lines`);
-
-// Verify no overlap in receipts
-const rcptOverlap = [...group1Receipts].filter(r => group2Receipts.has(r));
-console.log(`Receipt overlap: ${rcptOverlap.length}`);
-
-// Verify no overlap in invoices
-const group1Invoices = new Set();
-const group2Invoices = new Set();
-for (const r of group1Receipts) {
-  for (const inv of rcptMap.get(r).invMasters) group1Invoices.add(inv);
-}
-for (const r of group2Receipts) {
-  for (const inv of rcptMap.get(r).invMasters) group2Invoices.add(inv);
-}
-const invOverlap = [...group1Invoices].filter(inv => group2Invoices.has(inv));
-console.log(`Invoice overlap: ${invOverlap.length}`);
-
-// Write the two files, maintaining original order (by line position in the file)
-// We need to preserve the original line order within each group
-const group1Output = [];
-const group2Output = [];
+// Write the files, maintaining original order (by line position in the file)
+const groupOutputs = Array.from({ length: NUM_GROUPS }, () => []);
 
 for (const line of lines) {
   const cols = line.split('\t');
   const rcptMaster = parseInt(cols[4].trim(), 10);
-  if (group1Receipts.has(rcptMaster)) {
-    group1Output.push(line);
-  } else if (group2Receipts.has(rcptMaster)) {
-    group2Output.push(line);
+  for (let i = 0; i < NUM_GROUPS; i++) {
+    if (groupReceipts[i].has(rcptMaster)) {
+      groupOutputs[i].push(line);
+      break;
+    }
   }
 }
 
-fs.writeFileSync(path.join(__dirname, 'resources', 'malformedData1'), group1Output.join('\n') + '\n', 'utf-8');
-fs.writeFileSync(path.join(__dirname, 'resources', 'malformedData2'), group2Output.join('\n') + '\n', 'utf-8');
-
-console.log(`\nWritten malformedData1: ${group1Output.length} lines`);
-console.log(`Written malformedData2: ${group2Output.length} lines`);
+for (let i = 0; i < NUM_GROUPS; i++) {
+  const fileName = `malformedData${i + 1}`;
+  fs.writeFileSync(path.join(__dirname, 'resources', fileName), groupOutputs[i].join('\n') + '\n', 'utf-8');
+  console.log(`\nWritten ${fileName}: ${groupOutputs[i].length} lines`);
+}
 console.log('Done!');
