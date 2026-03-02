@@ -142,6 +142,59 @@ async function dismissPopup(page: Page): Promise<void> {
 }
 
 /**
+ * Extract validation-error messages from the 3E form error panel.
+ *
+ * The UI shows a small warning icon thumbnail (`.error-thumbnail-background`)
+ * that, when clicked, switches to the errors tab.  Each error is rendered as
+ * a `mat-card` whose `mat-card-title` holds context (e.g. "1. Receipt") and
+ * whose `e3e-navigation-link .message` holds the actual message.
+ *
+ * Returns an array of human-readable error strings, or an empty array if
+ * no error panel / messages are found.
+ */
+async function extractValidationErrors(page: Page, timeoutMs?: number): Promise<string[]> {
+  const timeout = timeoutMs ?? 5000;
+  const errors: string[] = [];
+
+  try {
+    // 1. Click the warning icon thumbnail to open the errors tab.
+    const errorThumbnail = page.locator('div.error-thumbnail-background').first();
+    if (await errorThumbnail.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await stableClick(errorThumbnail, 'Error warning thumbnail', { retries: 2, timeoutMs: timeout });
+      await delay(500); // Let the tab transition animation finish.
+    }
+
+    // 2. Locate the active tab body that contains the error cards.
+    const activeTabBody = page.locator('mat-tab-body.mat-tab-body-active');
+    await activeTabBody.waitFor({ state: 'visible', timeout }).catch(() => {});
+
+    // 3. Each error is a mat-card with a title and a message.
+    const errorCards = activeTabBody.locator('mat-card');
+    const cardCount = await errorCards.count();
+
+    for (let i = 0; i < cardCount; i++) {
+      const card = errorCards.nth(i);
+
+      const title = ((await card.locator('mat-card-title').textContent().catch(() => null)) ?? '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const message = ((await card.locator('e3e-navigation-link .message').textContent().catch(() => null)) ?? '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (message.length > 0) {
+        const entry = title.length > 0 ? `[${title}] ${message}` : message;
+        errors.push(entry);
+      }
+    }
+  } catch {
+    // Error panel may not exist or may have closed — return whatever we collected.
+  }
+
+  return errors;
+}
+
+/**
  * Cancel the currently open process row: click Cancel, then confirm Yes.
  */
 async function cancelCurrentRow(page: Page): Promise<void> {
@@ -154,23 +207,6 @@ async function cancelCurrentRow(page: Page): Promise<void> {
   await stableClick(confirmYesButton, 'Cancel confirmation Yes button');
   await page.waitForLoadState('domcontentloaded');
   console.log('    \u2717 Row cancelled');
-}
-
-/**
- * Append receipt entries to the run's whitelist file on successful submission.
- */
-function appendToWhiteList(
-  whiteListPath: string,
-  receipt: ReceiptGroup,
-  reversedReceiptIndex?: string | null,
-): void {
-  const header = `# Receipt ${receipt.rcptMasterIndex} — SUBMITTED SUCCESSFULLY\n`;
-  const reversedReceiptLine = reversedReceiptIndex
-    ? `# Reversed receipt index: ${reversedReceiptIndex}\n`
-    : '';
-  const lines = receipt.rawLines.join('\n');
-  fs.appendFileSync(whiteListPath, header + reversedReceiptLine + lines + '\n\n', 'utf-8');
-  console.log(`    ✓ Receipt ${receipt.rcptMasterIndex} added to whitelist`);
 }
 
 /**
@@ -351,26 +387,101 @@ async function stableClick(
   await target.waitFor({ state: 'visible', timeout: timeoutMs });
   await expect(target).toBeEnabled({ timeout: timeoutMs });
 
+  // Scroll the element into the viewport so pointer events are not blocked by
+  // an out-of-view ancestor or a sticky header/footer overlay.
+  await target.scrollIntoViewIfNeeded({ timeout: timeoutMs });
+
   let lastError: unknown;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      // trial: true verifies the element will accept the click (actionability
+      // check) without actually dispatching the event.
       await target.click({ timeout: timeoutMs, trial: true });
+
+      // Brief settle delay: Angular Material buttons and dropdowns run a
+      // change-detection cycle after hover / focus that can leave the element
+      // in a transitioning state.  A short pause lets CSS animations finish
+      // before we dispatch the real click.
+      await delay(80);
+
       await target.click({ timeout: timeoutMs });
       return;
     } catch (error) {
       lastError = error;
       if (attempt < retries) {
-        await delay(200 * attempt);
+        await delay(250 * attempt);
       }
     }
   }
 
+  // First fallback: force click (bypasses actionability, useful when an
+  // invisible overlay intercepts pointer events).
   if (forceOnLastRetry) {
-    await target.click({ timeout: timeoutMs, force: true });
+    try {
+      await target.click({ timeout: timeoutMs, force: true });
+      return;
+    } catch (forceError) {
+      lastError = forceError;
+    }
+  }
+
+  // Last-resort fallback: dispatch a synthetic click via the DOM.  This
+  // reaches the element's click handler even when Playwright's pointer-based
+  // click cannot land (e.g. the element is behind a non-interactable layer).
+  try {
+    await target.dispatchEvent('click');
     return;
+  } catch (dispatchError) {
+    lastError = dispatchError;
   }
 
   throw new Error(`Stable click failed for ${label}: ${String(lastError ?? 'unknown error')}`);
+}
+
+/**
+ * Hover over `target` and poll until `revealedLocator` becomes visible.
+ * Retries the full hover if the expected element does not appear, which
+ * handles cases where the pointer drifts off the element mid-animation
+ * and the Angular Material submenu collapses before we can act on it.
+ */
+async function stableHover(
+  target: Locator,
+  revealedLocator: Locator,
+  label: string,
+  options?: {
+    timeoutMs?: number;
+    retries?: number;
+    postHoverDelayMs?: number;
+  },
+): Promise<void> {
+  const timeoutMs = options?.timeoutMs ?? config.defaultTimeoutMs;
+  const retries = options?.retries ?? 4;
+  const postHoverDelayMs = options?.postHoverDelayMs ?? 150;
+
+  await target.waitFor({ state: 'visible', timeout: timeoutMs });
+  await target.scrollIntoViewIfNeeded({ timeout: timeoutMs });
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await target.hover({ timeout: timeoutMs, force: false });
+      // Allow CSS transition / Angular animation to complete.
+      await delay(postHoverDelayMs);
+
+      // Confirm the downstream element has appeared before returning.
+      await revealedLocator.waitFor({ state: 'visible', timeout: 3000 });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) {
+        // Move mouse away briefly to reset any hover state, then retry.
+        await target.page().mouse.move(0, 0);
+        await delay(300 * attempt);
+      }
+    }
+  }
+
+  throw new Error(`Stable hover failed for ${label}: ${String(lastError ?? 'unknown error')}`);
 }
 
 /**
@@ -410,25 +521,59 @@ async function openOldestActionListItem(page: Page, actionListItems: Locator): P
 /**
  * Click the primary Submit action (Release) using stable selectors.
  * Falls back to role/text-based submit if needed.
+ *
+ * Angular Material toolbar buttons are rendered asynchronously; the button
+ * may briefly exist in the DOM but be disabled or obscured by a loading
+ * overlay.  An outer retry loop re-scans all candidates so a transient
+ * failure on one selector does not mask another that becomes ready later.
  */
 async function clickSubmitAction(page: Page): Promise<void> {
-  const candidates = [
-    page.locator('button[data-automation-id="RELEASE"]:visible').first(),
-    page.locator('particle-button-dropdown[pendo-id="RELEASE"] button:visible').first(),
-    page.getByRole('button', { name: /^\s*Submit\s*$/ }).first(),
-  ];
+  // Let Angular finish any in-flight change-detection cycle before we look
+  // for the button.  domcontentloaded is fast and avoids races that happen
+  // when the toolbar rerenders after a prior async operation.
+  await page.waitForLoadState('domcontentloaded');
 
+  const candidateSelectors = [
+    'button[data-automation-id="RELEASE"]',
+    'particle-button-dropdown[pendo-id="RELEASE"] button',
+  ] as const;
+
+  const maxAttempts = 4;
   let lastError: unknown;
-  for (const candidate of candidates) {
-    try {
-      if ((await candidate.count()) === 0) {
-        continue;
-      }
 
-      await stableClick(candidate, 'Submit/Release button', { retries: 3 });
-      return;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // 1. Try strongly-typed automation-ID / pendo-ID selectors first.
+    for (const selector of candidateSelectors) {
+      const candidate = page.locator(selector).first();
+      try {
+        if (!(await candidate.isVisible())) continue;
+
+        // Extra settle: wait for the button to be enabled (Angular may
+        // disable toolbar actions while processing a previous operation).
+        await expect(candidate).toBeEnabled({ timeout: config.defaultTimeoutMs });
+
+        await stableClick(candidate, 'Submit/Release button', { retries: 2 });
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    // 2. Role-based fallback (catches apps that render plain <button>Submit</button>).
+    const roleCandidate = page.getByRole('button', { name: /^\s*Submit\s*$/ }).first();
+    try {
+      if (await roleCandidate.isVisible()) {
+        await expect(roleCandidate).toBeEnabled({ timeout: config.defaultTimeoutMs });
+        await stableClick(roleCandidate, 'Submit button (role fallback)', { retries: 2 });
+        return;
+      }
     } catch (error) {
       lastError = error;
+    }
+
+    if (attempt < maxAttempts) {
+      // Brief back-off before rescanning — Angular may still be rendering.
+      await delay(400 * attempt);
     }
   }
 
@@ -585,7 +730,26 @@ async function processReceipt(
       // Fatal error — blacklist the receipt and cancel the row
       console.log(`    \u26a0 Blocked receipt detected: ${msg}`);
       await dismissPopup(page);
-      appendToBlackList(blackListPath, receipt, msg);
+
+      // Capture detailed validation errors from the error panel before blacklisting.
+      const validationErrors = await extractValidationErrors(page);
+      if (validationErrors.length > 0) {
+        console.log(`    ▸ Validation errors (${validationErrors.length}):`);
+        for (const ve of validationErrors) {
+          console.log(`      • ${ve}`);
+        }
+      }
+
+      const validationSummary =
+        validationErrors.length > 0
+          ? validationErrors.map((e, i) => `  ${i + 1}. ${e}`).join('\n')
+          : null;
+
+      const failureReason = validationSummary
+        ? `${msg}\n# Validation errors:\n${validationSummary}`
+        : msg;
+
+      appendToBlackList(blackListPath, receipt, failureReason);
       await cancelCurrentRow(page);
       await navigateAndWait(page, `${config.baseUrl}/dashboard`);
       return { success: false, processId: null };
@@ -710,22 +874,55 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
     const childFormOptionsButton = page
       .locator('button.child-form-tabs-btn.options-menu')
       .first();
-    await childFormOptionsButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await stableClick(childFormOptionsButton, 'Child form options button');
 
     const invoicesMenuItem = page
       .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[mat-menu-item]')
       .filter({ hasText: 'Invoices' })
       .first();
-    await invoicesMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await invoicesMenuItem.hover();
 
+    // The "Add" submenu item only appears after hovering over "Invoices".
     const overlayAddMenuItem = page
       .locator('.cdk-overlay-pane .mat-menu-panel:not(.mat-menu-panel-hidden) button[mat-menu-item]')
       .filter({ hasText: /^\s*Add\s*$/ })
       .first();
-    await overlayAddMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await stableClick(overlayAddMenuItem, 'Invoices Add menu item');
+
+    // Retry the full open-menu → hover → click sequence because Angular Material
+    // menus collapse when the pointer drifts off the panel mid-animation, leaving
+    // the Add item invisible before stableClick can reach it.
+    const maxMenuRetries = 3;
+    let lastMenuError: unknown;
+    for (let menuAttempt = 1; menuAttempt <= maxMenuRetries; menuAttempt++) {
+      try {
+        await childFormOptionsButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+        await stableClick(childFormOptionsButton, 'Child form options button');
+
+        await invoicesMenuItem.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+
+        // stableHover retries the hover and polls for the Add submenu item to
+        // become visible, catching cases where the pointer leaves the panel too
+        // quickly and the submenu collapses before we can click.
+        await stableHover(invoicesMenuItem, overlayAddMenuItem, 'Invoices submenu item', {
+          timeoutMs: config.navigationTimeoutMs,
+          retries: 4,
+          postHoverDelayMs: 200,
+        });
+
+        await stableClick(overlayAddMenuItem, 'Invoices Add menu item');
+        return;
+      } catch (error) {
+        lastMenuError = error;
+        if (menuAttempt < maxMenuRetries) {
+          // Dismiss any stale overlay before re-opening the menu.
+          await page.keyboard.press('Escape');
+          await delay(500 * menuAttempt);
+        }
+      }
+    }
+
+    throw new Error(
+      `openInvoiceSearchDialogFromOptionsMenu failed after ${maxMenuRetries} attempts: ` +
+      String(lastMenuError ?? 'unknown error'),
+    );
   }
 
   async function openInvoiceSearchDialogFromDirectAddButton(): Promise<void> {
@@ -831,7 +1028,6 @@ async function submitOpenedReceipts(
   page: Page,
   processIdMap: Map<string, ReceiptGroup>,
   blackListPath: string,
-  whiteListPath: string,
 ): Promise<void> {
   await page.bringToFront();
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
@@ -916,6 +1112,20 @@ async function submitOpenedReceipts(
       console.log(`    \u26a0 Popup detected after Phase 3 submit: ${msg}`);
       await dismissPopup(page);
 
+      // Attempt to read detailed validation errors from the error panel.
+      const validationErrors = await extractValidationErrors(page);
+      const validationSummary =
+        validationErrors.length > 0
+          ? validationErrors.map((e, i) => `  ${i + 1}. ${e}`).join('\n')
+          : null;
+
+      if (validationErrors.length > 0) {
+        console.log(`    ▸ Validation errors (${validationErrors.length}):`);
+        for (const ve of validationErrors) {
+          console.log(`      • ${ve}`);
+        }
+      }
+
       const alreadyBlacklisted = !!currentProcessId && blacklistedProcessIds.has(currentProcessId);
 
       if (alreadyBlacklisted) {
@@ -923,11 +1133,16 @@ async function submitOpenedReceipts(
       } else {
         if (currentProcessId) blacklistedProcessIds.add(currentProcessId);
 
+        // Build the failure reason string that will be written to the blacklist.
+        const failureReason = validationSummary
+          ? `Phase 3 submit failure \u2014 ${msg}\n# Validation errors:\n${validationSummary}`
+          : `Phase 3 submit failure \u2014 ${msg}`;
+
         if (currentReceipt) {
           appendToBlackList(
             blackListPath,
             currentReceipt,
-            `Phase 3 submit failure \u2014 ${msg}`,
+            failureReason,
             relatedReversedReceiptIndex,
           );
         } else {
@@ -936,7 +1151,7 @@ async function submitOpenedReceipts(
             : '';
           fs.appendFileSync(
             blackListPath,
-            `# Unknown receipt \u2014 Phase 3 submit failure \u2014 ${msg}\n${reversedReceiptLine}\n`,
+            `# Unknown receipt \u2014 ${failureReason}\n${reversedReceiptLine}\n`,
             'utf-8',
           );
           console.log('    \u2717 Unknown receipt added to blacklist');
@@ -949,20 +1164,6 @@ async function submitOpenedReceipts(
     }
 
     await page.waitForLoadState('networkidle', { timeout: config.navigationTimeoutMs });
-
-    if (currentReceipt) {
-      appendToWhiteList(whiteListPath, currentReceipt, openedReversedReceiptIndex);
-    } else {
-      const reversedLine = openedReversedReceiptIndex
-        ? `# Reversed receipt index: ${openedReversedReceiptIndex}\n`
-        : '';
-      fs.appendFileSync(
-        whiteListPath,
-        `# Unknown receipt — submitted successfully (no matching receipt group)\n${reversedLine}\n`,
-        'utf-8',
-      );
-      console.log('    ✓ Unknown receipt added to whitelist');
-    }
 
     submitted++;
     console.log(`    \u2713 Submit completed (${submitted} total)`);
@@ -1006,7 +1207,6 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
   // Generate a unique blacklist file path for this run
   const runTimestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const blackListFilePath = path.resolve(__dirname, '..', 'resources', `blackList_${runTimestamp}`);
-  const whiteListFilePath = path.resolve(__dirname, '..', 'resources', `whiteList_${runTimestamp}`);
 
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
     const batch = batches[batchIndex];
@@ -1055,15 +1255,12 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
 
     // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
     console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
-    await submitOpenedReceipts(page, processIdMap, blackListFilePath, whiteListFilePath);
+    await submitOpenedReceipts(page, processIdMap, blackListFilePath);
   }
 
   await azurePage.close();
 
-  // Report whitelist / blacklist summary
-  if (fs.existsSync(whiteListFilePath)) {
-    console.log(`\n\u2713 Successfully submitted receipts recorded \u2014 see ${whiteListFilePath}`);
-  }
+  // Report blacklist summary
   if (fs.existsSync(blackListFilePath)) {
     console.log(`\n\u26a0 Some receipts were blacklisted \u2014 see ${blackListFilePath}`);
   }
