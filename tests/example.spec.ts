@@ -97,6 +97,49 @@ function groupByReceipt(entries: MalformedEntry[]): ReceiptGroup[] {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+/* ================================================================== *
+ *  Debug log — mirrors every console.log to a per-run .txt file       *
+ * ================================================================== */
+
+/** File path for the current run's debug log. Set once in the main test. */
+let debugLogFilePath: string | null = null;
+
+/**
+ * Initialise the debug log file for this run.
+ * Call once at the start of the test, after generating the run timestamp.
+ */
+function initDebugLog(runTimestamp: string): void {
+  debugLogFilePath = path.resolve(
+    __dirname,
+    '..',
+    'resources',
+    `debugLog_${runTimestamp}.txt`,
+  );
+  fs.writeFileSync(
+    debugLogFilePath,
+    `# Debug log — run started ${runTimestamp}\n\n`,
+    'utf-8',
+  );
+}
+
+/**
+ * Log a message to both the console and the per-run debug log file.
+ * Accepts the same arguments as console.log.
+ */
+function debugLog(...args: unknown[]): void {
+  // Write to Playwright's console output as usual.
+  console.log(...args);
+
+  // Append to the debug log file (with ISO timestamp prefix per line).
+  if (debugLogFilePath) {
+    const timestamp = new Date().toISOString();
+    const message = args
+      .map(a => (typeof a === 'string' ? a : JSON.stringify(a)))
+      .join(' ');
+    fs.appendFileSync(debugLogFilePath, `[${timestamp}] ${message}\n`, 'utf-8');
+  }
+}
+
 function chunkArray<T>(items: T[], size: number): T[][] {
   if (size <= 0) {
     throw new Error(`Invalid batch size: ${size}. receiptBatchSize must be greater than 0.`);
@@ -223,9 +266,9 @@ async function captureFailureDiagnostics(
       fullPage: false,
       timeout: 10_000,
     });
-    console.log(`    📸 Screenshot saved: test-results/${screenshotName}.png`);
+    debugLog(`    📸 Screenshot saved: test-results/${screenshotName}.png`);
   } catch {
-    console.log('    ⚠ Could not capture failure screenshot');
+    debugLog('    ⚠ Could not capture failure screenshot');
   }
 
   // Log the visible toolbar actions and any error indicators for debugging.
@@ -238,7 +281,7 @@ async function captureFailureDiagnostics(
         const txt = ((await toolbarButtons.nth(i).textContent().catch(() => null)) ?? '').trim();
         if (txt) labels.push(txt);
       }
-      console.log(`    🔍 Visible toolbar buttons: ${labels.join(', ')}`);
+      debugLog(`    🔍 Visible toolbar buttons: ${labels.join(', ')}`);
     }
 
     const hasErrorThumbnail = await page
@@ -247,7 +290,7 @@ async function captureFailureDiagnostics(
       .isVisible()
       .catch(() => false);
     if (hasErrorThumbnail) {
-      console.log('    🔍 Error warning thumbnail is visible on the form');
+      debugLog('    🔍 Error warning thumbnail is visible on the form');
     }
   } catch {
     // Non-critical — diagnostics should never block the flow.
@@ -266,7 +309,7 @@ async function cancelCurrentRow(page: Page): Promise<void> {
   await confirmYesButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
   await stableClick(confirmYesButton, 'Cancel confirmation Yes button');
   await page.waitForLoadState('domcontentloaded');
-  console.log('    \u2717 Row cancelled');
+  debugLog('    \u2717 Row cancelled');
 }
 
 /**
@@ -284,7 +327,7 @@ function appendToBlackList(
     : '';
   const lines = receipt.rawLines.join('\n');
   fs.appendFileSync(blackListPath, header + reversedReceiptLine + lines + '\n\n', 'utf-8');
-  console.log(`    \u2717 Receipt ${receipt.rcptMasterIndex} added to blacklist`);
+  debugLog(`    \u2717 Receipt ${receipt.rcptMasterIndex} added to blacklist`);
 }
 
 async function getCurrentReceiptIndex(page: Page): Promise<string | null> {
@@ -341,7 +384,7 @@ function parseProcessIdFromUrl(url: string): string | null {
     }
 
     fs.appendFileSync(blackListPath, sections.join('\n\n') + '\n\n', 'utf-8');
-    console.log(`    ✗ Added ${remainingCount} remaining action-list item(s) to blacklist`);
+    debugLog(`    ✗ Added ${remainingCount} remaining action-list item(s) to blacklist`);
   }
 
 /**
@@ -674,7 +717,7 @@ async function login(page: Page): Promise<void> {
   await stableClick(page.getByRole('button', { name: 'Sign in' }), 'Login Sign in button');
   await stableClick(page.getByRole('button', { name: 'Yes' }), 'Stay signed in Yes button');
   await page.waitForLoadState('domcontentloaded');
-  console.log('  Login successful');
+  debugLog('  Login successful');
 }
 
 /* ================================================================== *
@@ -686,7 +729,7 @@ async function processReceipt(
   receipt: ReceiptGroup,
   blackListPath: string,
 ): Promise<{ success: boolean; processId: string | null }> {
-  console.log(`  ▸ Processing receipt ${receipt.rcptMasterIndex} (${receipt.invNumbers.length} invoice(s))`);
+  debugLog(`  ▸ Processing receipt ${receipt.rcptMasterIndex} (${receipt.invNumbers.length} invoice(s))`);
 
   // Navigate to receipt process page (full reload resets Angular state)
   await navigateAndWait(page, `${config.baseUrl}/process/RcptMaster#RcptMaster`);
@@ -703,7 +746,7 @@ async function processReceipt(
   // Click the SEARCH button — the app auto-selects the matching receipt and opens it
   await stableClick(page.getByRole('button', { name: 'SEARCH' }), 'Receipt SEARCH button');
   await page.locator('e3e-form-renderer').waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-  console.log(`    ✓ Receipt ${receipt.rcptMasterIndex} opened`);
+  debugLog(`    ✓ Receipt ${receipt.rcptMasterIndex} opened`);
 
   // Extract receipt metadata
   const rcptType = (await page
@@ -793,7 +836,7 @@ async function processReceipt(
 
     if (isMatterBlocked) {
       // Fatal error — blacklist the receipt and cancel the row
-      console.log(`    \u26a0 Blocked receipt detected: ${msg}`);
+      debugLog(`    \u26a0 Blocked receipt detected: ${msg}`);
       await dismissPopup(page);
 
       // Capture screenshot + UI state for offline debugging.
@@ -802,9 +845,9 @@ async function processReceipt(
       // Capture detailed validation errors from the error panel before blacklisting.
       const validationErrors = await extractValidationErrors(page);
       if (validationErrors.length > 0) {
-        console.log(`    ▸ Validation errors (${validationErrors.length}):`);
+        debugLog(`    ▸ Validation errors (${validationErrors.length}):`);
         for (const ve of validationErrors) {
-          console.log(`      • ${ve}`);
+          debugLog(`      • ${ve}`);
         }
       }
 
@@ -824,7 +867,7 @@ async function processReceipt(
     }
 
     // Non-fatal popup (e.g. informational message about a successful reversal) — dismiss and continue
-    console.log(`    \u2139 Informational popup (not an error): ${msg}`);
+    debugLog(`    \u2139 Informational popup (not an error): ${msg}`);
     await dismissPopup(page);
   }
 
@@ -844,15 +887,15 @@ async function processReceipt(
 
     processId = parseProcessIdFromUrl(page.url());
     if (processId) {
-      console.log(`    \u2713 Captured process ID from top action list item: ${processId}`);
+      debugLog(`    \u2713 Captured process ID from top action list item: ${processId}`);
     } else {
-      console.log(`    \u26a0 Could not parse process ID from URL: ${page.url()}`);
+      debugLog(`    \u26a0 Could not parse process ID from URL: ${page.url()}`);
     }
 
     // Navigate back to dashboard without submitting anything
     await navigateAndWait(page, `${config.baseUrl}/dashboard`);
   } catch {
-    console.log(`    \u26a0 Could not capture process ID from action list`);
+    debugLog(`    \u26a0 Could not capture process ID from action list`);
   }
 
   return { success: true, processId };
@@ -874,68 +917,86 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
     .first();
   await expect(removeActionsContainer).toBeVisible({ timeout: config.navigationTimeoutMs });
 
-  const removeDropdownButtons = removeActionsContainer
-    .locator('button[data-automation-id$="/childObjects/RcptInvoice/actions/Remove-dropdown"]:visible');
-
-  async function getActiveRemoveDropdownButton() {
-    const count = await removeDropdownButtons.count();
-    if (count === 0) {
-      throw new Error('Remove dropdown button was not found in Remove actions container');
-    }
-    return removeDropdownButtons.nth(count - 1);
-  }
-
   async function openRemoveMenuAndClickRemoveAll(): Promise<void> {
+    // The Remove dropdown is an Angular Material mat-menu-trigger.  Its click
+    // handler toggles a cdk-overlay menu.  Playwright's pointer-based click()
+    // sometimes fires during Angular's mouseenter change-detection cycle and
+    // registers as a hover instead of a click.
+    //
+    // Strategy: use evaluate(el => el.click()) to dispatch a synchronous DOM
+    // click event that bypasses pointer-event timing entirely.  Then locate
+    // the "Remove All" menu item directly in the overlay (no aria-controls
+    // indirection needed — the overlay is page-global).
+
+    const maxAttempts = 4;
     let lastError: unknown;
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const removeDropdownButton = await getActiveRemoveDropdownButton();
-        await expect(removeDropdownButton).toBeVisible({ timeout: config.navigationTimeoutMs });
-        await expect(removeDropdownButton).toBeEnabled({ timeout: config.navigationTimeoutMs });
+        // Re-query the button each attempt (Angular may re-render the row GUID).
+        const removeDropdownButton = page
+          .locator('button[data-automation-id$="/childObjects/RcptInvoice/actions/Remove-dropdown"]')
+          .first();
 
+        await removeDropdownButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
+        await expect(removeDropdownButton).toBeEnabled({ timeout: config.defaultTimeoutMs });
+
+        // If the menu is already open from a prior failed attempt, close it first.
         if ((await removeDropdownButton.getAttribute('aria-expanded')) === 'true') {
           await page.keyboard.press('Escape');
-          await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'false', { timeout: 2000 });
-        }
-
-        // Let Playwright's click() handle scrolling — an explicit
-        // scrollIntoViewIfNeeded here would scroll the wrong container
-        // when the button is inside a child-form panel, causing the
-        // overlay to detach.
-        await stableClick(removeDropdownButton, 'Remove dropdown button');
-
-        if ((await removeDropdownButton.getAttribute('aria-expanded')) !== 'true') {
           await delay(300);
-          await stableClick(removeDropdownButton, 'Remove dropdown button force retry', { forceOnLastRetry: true, retries: 1 });
         }
 
-        await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'true', { timeout: 4000 });
+        // Synchronous DOM click — most reliable for mat-menu-trigger.
+        await removeDropdownButton.evaluate((el) => (el as HTMLElement).click());
 
-        const menuId = await removeDropdownButton.getAttribute('aria-controls');
-        if (!menuId) {
-          throw new Error('Remove dropdown did not expose aria-controls after opening menu');
-        }
-
-        const activeMenuPanel = page.locator(`#${menuId}`);
-        await expect(activeMenuPanel).toBeVisible({ timeout: 4000 });
-
-        const removeAllMenuItem = activeMenuPanel
+        // Wait for the menu overlay to appear.  Locate "Remove All" directly
+        // — it's the definitive signal the menu opened successfully.
+        const removeAllMenuItem = page
           .locator('button[data-automation-id$="/childObjects/RcptInvoice/actions/btnRemoveAll"]')
           .first();
-        await expect(removeAllMenuItem).toBeVisible({ timeout: config.defaultTimeoutMs });
-        await stableClick(removeAllMenuItem, 'Remove All menu item');
 
-        await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'false', { timeout: 4000 });
+        const menuOpened = await removeAllMenuItem
+          .waitFor({ state: 'visible', timeout: 4000 })
+          .then(() => true)
+          .catch(() => false);
+
+        if (!menuOpened) {
+          // DOM click didn't open the menu — try Playwright force-click as a 2nd path.
+          await removeDropdownButton.click({ force: true, timeout: 5000 });
+          await removeAllMenuItem.waitFor({ state: 'visible', timeout: 4000 });
+        }
+
+        // Let mat-menu's enter animation finish before interacting with items.
+        // The menu uses @transformMenu with a 120ms cubic-bezier transition;
+        // clicking during the animation can miss because the overlay is still
+        // fading in / repositioning.
+        await delay(200);
+
+        // Click "Remove All" via Playwright's click() — unlike the dropdown
+        // trigger, menu items don't have the mouseenter timing issue.
+        // Playwright's click is preferred here because Angular's
+        // e3e-delay-CollectionAction directive requires a full mousedown →
+        // mouseup → click sequence fired within Angular's zone, which a bare
+        // evaluate(el.click()) doesn't provide.
+        await removeAllMenuItem.click({ timeout: 5000 });
+
+        // Confirm the menu closed (Angular processes the action).
+        await removeAllMenuItem.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
         return;
       } catch (error) {
         lastError = error;
+        // Dismiss any stale overlay before retrying.
         await page.keyboard.press('Escape');
-        await delay(400);
+        await delay(400 * attempt);
+        debugLog(`    ⟳ Remove dropdown attempt ${attempt}/${maxAttempts} failed — retrying`);
       }
     }
 
-    throw lastError;
+    throw new Error(
+      `openRemoveMenuAndClickRemoveAll failed after ${maxAttempts} attempts: ` +
+      String(lastError ?? 'unknown error'),
+    );
   }
 
   await openRemoveMenuAndClickRemoveAll();
@@ -1040,7 +1101,7 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
   }
 
   for (const [invoiceIndex, invNumber] of receipt.invNumbers.entries()) {
-    console.log(`    ▹ Adding invoice ${invNumber}`);
+    debugLog(`    ▹ Adding invoice ${invNumber}`);
 
     if (invoiceIndex === 0) {
       await openInvoiceSearchDialogFromOptionsMenu();
@@ -1059,7 +1120,7 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
  * ================================================================== */
 
 async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string): Promise<void> {
-  console.log(`  ▸ Triggering runbook for ${label} — invoices: ${invoiceIds}`);
+  debugLog(`  ▸ Triggering runbook for ${label} — invoices: ${invoiceIds}`);
 
   await azurePage.bringToFront();
   await navigateAndWait(azurePage, config.azureRunbookUrl);
@@ -1090,7 +1151,7 @@ async function triggerRunbook(azurePage: Page, invoiceIds: string, label: string
       .catch(() => null);
 
     if (statusText?.includes('Completed')) {
-      console.log(`    ✓ Runbook completed for ${label}`);
+      debugLog(`    ✓ Runbook completed for ${label}`);
       return;
     }
   }
@@ -1117,7 +1178,7 @@ async function submitOpenedReceipts(
   await navigateAndWait(page, `${config.baseUrl}/dashboard`);
 
   const actionListItems = page.locator('e3e-dashboard-action-list-panel ul.action-list-items li');
-  console.log(`  ▸ Draining all opened processes from action list`);
+  debugLog(`  ▸ Draining all opened processes from action list`);
 
   // Safety limit: at most one iteration per mapped receipt plus a margin for leftovers.
   const maxIterations = processIdMap.size + 20;
@@ -1141,7 +1202,7 @@ async function submitOpenedReceipts(
 
     const count = await actionListItems.count();
     if (count === 0) {
-      console.log('    \u2713 Action list is empty \u2014 all processes submitted');
+      debugLog('    \u2713 Action list is empty \u2014 all processes submitted');
       break;
     }
 
@@ -1149,7 +1210,7 @@ async function submitOpenedReceipts(
     if (count >= lastActionListCount) {
       consecutiveStalls++;
       if (consecutiveStalls >= maxConsecutiveStalls) {
-        console.log(
+        debugLog(
           `    \u26a0 Action list stuck at ${count} item(s) after ${consecutiveStalls} consecutive stalls \u2014 ` +
           `remaining items likely need manual intervention`,
         );
@@ -1160,7 +1221,7 @@ async function submitOpenedReceipts(
     }
     lastActionListCount = count;
 
-    console.log(`    Action list has ${count} item(s) remaining`);
+    debugLog(`    Action list has ${count} item(s) remaining`);
     await expect(actionListItems.first()).toBeVisible({ timeout: config.navigationTimeoutMs });
 
     // Open the oldest item (last in the list)
@@ -1173,10 +1234,10 @@ async function submitOpenedReceipts(
 
     if (currentProcessId && processIdMap.has(currentProcessId)) {
       currentReceipt = processIdMap.get(currentProcessId)!;
-      console.log(`    \u25b9 Matched process ${currentProcessId} \u2192 receipt ${currentReceipt.rcptMasterIndex}`);
+      debugLog(`    \u25b9 Matched process ${currentProcessId} \u2192 receipt ${currentReceipt.rcptMasterIndex}`);
       await updateReceiptInvoices(page, currentReceipt);
     } else {
-      console.log(
+      debugLog(
         `    \u25b9 No matching receipt found for process ${currentProcessId ?? '(no GUID in URL)'} \u2014 submitting without invoice changes`,
       );
     }
@@ -1193,7 +1254,7 @@ async function submitOpenedReceipts(
       const relatedReversedReceiptIndex =
         (await getCurrentReceiptIndex(page)) ?? openedReversedReceiptIndex;
 
-      console.log(`    \u26a0 Popup detected after Phase 3 submit: ${msg}`);
+      debugLog(`    \u26a0 Popup detected after Phase 3 submit: ${msg}`);
       await dismissPopup(page);
 
       // Capture screenshot + UI state for offline debugging.
@@ -1210,16 +1271,16 @@ async function submitOpenedReceipts(
           : null;
 
       if (validationErrors.length > 0) {
-        console.log(`    ▸ Validation errors (${validationErrors.length}):`);
+        debugLog(`    ▸ Validation errors (${validationErrors.length}):`);
         for (const ve of validationErrors) {
-          console.log(`      • ${ve}`);
+          debugLog(`      • ${ve}`);
         }
       }
 
       const alreadyBlacklisted = !!currentProcessId && blacklistedProcessIds.has(currentProcessId);
 
       if (alreadyBlacklisted) {
-        console.log(`    ↷ Process ${currentProcessId} already blacklisted — skipping duplicate entry`);
+        debugLog(`    ↷ Process ${currentProcessId} already blacklisted — skipping duplicate entry`);
       } else {
         if (currentProcessId) blacklistedProcessIds.add(currentProcessId);
 
@@ -1244,7 +1305,7 @@ async function submitOpenedReceipts(
             `# Unknown receipt \u2014 ${failureReason}\n${reversedReceiptLine}\n`,
             'utf-8',
           );
-          console.log('    \u2717 Unknown receipt added to blacklist');
+          debugLog('    \u2717 Unknown receipt added to blacklist');
         }
       }
 
@@ -1256,7 +1317,7 @@ async function submitOpenedReceipts(
     await page.waitForLoadState('networkidle', { timeout: config.navigationTimeoutMs });
 
     submitted++;
-    console.log(`    \u2713 Submit completed (${submitted} total)`);
+    debugLog(`    \u2713 Submit completed (${submitted} total)`);
   }
 
   // Final verification: navigate to dashboard and check the action list
@@ -1264,13 +1325,13 @@ async function submitOpenedReceipts(
   await delay(500);
   const remainingCount = await actionListItems.count();
   if (remainingCount > 0) {
-    console.log(
+    debugLog(
       `  \u26a0 Action list still has ${remainingCount} item(s) after ${submitted} submission(s). ` +
       `These may be blacklisted receipts requiring manual intervention.`,
     );
       await appendRemainingActionListItemsToBlackList(actionListItems, blackListPath);
   } else {
-    console.log(`  \u2713 Verified: action list is empty after submitting ${submitted} process(es)`);
+    debugLog(`  \u2713 Verified: action list is empty after submitting ${submitted} process(es)`);
   }
 }
 
@@ -1283,7 +1344,7 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
   const entries = parseMalformedData();
   const receiptGroups = groupByReceipt(entries);
   const batches = chunkArray(receiptGroups, config.receiptBatchSize);
-  console.log(
+  debugLog(
     `Parsed ${entries.length} entries across ${receiptGroups.length} receipt(s); ` +
     `processing in ${batches.length} batch(es) of up to ${config.receiptBatchSize}\n`,
   );
@@ -1297,16 +1358,17 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
   // Generate a unique blacklist file path for this run
   const runTimestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const blackListFilePath = path.resolve(__dirname, '..', 'resources', `blackList_${runTimestamp}`);
+  initDebugLog(runTimestamp);
 
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
     const batch = batches[batchIndex];
-    console.log(
+    debugLog(
       `\n═══ Batch ${batchIndex + 1}/${batches.length} ` +
       `(${batch.length} receipt(s)) ═══`,
     );
 
     // ── Phase 1: Open each receipt and perform reverse action ────────
-    console.log('═══ Phase 1: Process receipts ═══');
+    debugLog('═══ Phase 1: Process receipts ═══');
     const successfulReceipts: ReceiptGroup[] = [];
     const processIdMap = new Map<string, ReceiptGroup>();
     for (const receipt of batch) {
@@ -1315,21 +1377,21 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
         successfulReceipts.push(receipt);
         if (result.processId) {
           processIdMap.set(result.processId, receipt);
-          console.log(`  ↳ Mapped process ${result.processId} → receipt ${receipt.rcptMasterIndex}`);
+          debugLog(`  ↳ Mapped process ${result.processId} → receipt ${receipt.rcptMasterIndex}`);
         } else {
-          console.log(`  ⚠ Receipt ${receipt.rcptMasterIndex} succeeded but no process ID captured — will not be matched in Phase 3`);
+          debugLog(`  ⚠ Receipt ${receipt.rcptMasterIndex} succeeded but no process ID captured — will not be matched in Phase 3`);
         }
       }
     }
-    console.log(
+    debugLog(
       `  Phase 1 complete: ${successfulReceipts.length}/${batch.length} receipt(s) succeeded`,
     );
 
     // ── Phase 2: Trigger Azure Runbook with invoices from successful receipts ─
-    console.log('\n═══ Phase 2: Trigger Azure Runbook ═══');
+    debugLog('\n═══ Phase 2: Trigger Azure Runbook ═══');
     const batchInvMasterIndices = [...new Set(successfulReceipts.flatMap(r => r.invMasterIndices))];
     const batchInvoiceIds = batchInvMasterIndices.join(',');
-    console.log(
+    debugLog(
       `  Collected ${batchInvMasterIndices.length} distinct CORRUPTED invoice(s) from ` +
       `${successfulReceipts.length} successful receipt(s) in current batch`,
     );
@@ -1340,11 +1402,11 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
         `batch ${batchIndex + 1} (${successfulReceipts.length} receipt(s))`,
       );
     } else {
-      console.log('  No CORRUPTED invoices in this batch; skipping runbook trigger');
+      debugLog('  No CORRUPTED invoices in this batch; skipping runbook trigger');
     }
 
     // ── Phase 3: Submit opened receipts from dashboard (oldest first) ─
-    console.log('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
+    debugLog('\n═══ Phase 3: Submit opened receipts from dashboard ═══');
     await submitOpenedReceipts(page, processIdMap, blackListFilePath);
   }
 
@@ -1352,7 +1414,8 @@ test('process malformed receipts – end to end', async ({ page, context }) => {
 
   // Report blacklist summary
   if (fs.existsSync(blackListFilePath)) {
-    console.log(`\n\u26a0 Some receipts were blacklisted \u2014 see ${blackListFilePath}`);
+    debugLog(`\n\u26a0 Some receipts were blacklisted \u2014 see ${blackListFilePath}`);
   }
-  console.log('\n\u2713 All receipts processed');
+  debugLog('\n\u2713 All receipts processed');
+  debugLog(`\n📝 Debug log saved to ${debugLogFilePath}`);
 });
