@@ -157,16 +157,29 @@ async function extractValidationErrors(page: Page, timeoutMs?: number): Promise<
   const errors: string[] = [];
 
   try {
-    // 1. Click the warning icon thumbnail to open the errors tab.
+    // 1. Click the warning icon thumbnail to reveal the errors tab.
+    //    Use waitFor (which accepts a timeout) instead of isVisible (which does not).
     const errorThumbnail = page.locator('div.error-thumbnail-background').first();
-    if (await errorThumbnail.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await stableClick(errorThumbnail, 'Error warning thumbnail', { retries: 2, timeoutMs: timeout });
-      await delay(500); // Let the tab transition animation finish.
+    const thumbnailVisible = await errorThumbnail
+      .waitFor({ state: 'visible', timeout: 3000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (thumbnailVisible) {
+      // Use dispatchEvent to avoid Playwright scrolling the page for this
+      // indicator icon — we only need Angular to switch tabs, not a pointer hit.
+      await errorThumbnail.dispatchEvent('click');
+      await delay(600); // Let the tab transition animation finish.
     }
 
     // 2. Locate the active tab body that contains the error cards.
     const activeTabBody = page.locator('mat-tab-body.mat-tab-body-active');
-    await activeTabBody.waitFor({ state: 'visible', timeout }).catch(() => {});
+    const tabVisible = await activeTabBody
+      .waitFor({ state: 'visible', timeout })
+      .then(() => true)
+      .catch(() => false);
+
+    if (!tabVisible) return errors;
 
     // 3. Each error is a mat-card with a title and a message.
     const errorCards = activeTabBody.locator('mat-card');
@@ -192,6 +205,53 @@ async function extractValidationErrors(page: Page, timeoutMs?: number): Promise<
   }
 
   return errors;
+}
+
+/**
+ * Lightweight failure diagnostics: capture a screenshot and log visible UI state.
+ * Call this in any failure path before blacklisting so issues are diagnosable
+ * from the artifacts alone.
+ */
+async function captureFailureDiagnostics(
+  page: Page,
+  contextLabel: string,
+): Promise<void> {
+  try {
+    const screenshotName = `failure-${contextLabel}-${Date.now()}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+    await page.screenshot({
+      path: `test-results/${screenshotName}.png`,
+      fullPage: false,
+      timeout: 10_000,
+    });
+    console.log(`    📸 Screenshot saved: test-results/${screenshotName}.png`);
+  } catch {
+    console.log('    ⚠ Could not capture failure screenshot');
+  }
+
+  // Log the visible toolbar actions and any error indicators for debugging.
+  try {
+    const toolbarButtons = page.locator('e3e-process-toolbar button:visible');
+    const btnCount = await toolbarButtons.count().catch(() => 0);
+    if (btnCount > 0) {
+      const labels: string[] = [];
+      for (let i = 0; i < Math.min(btnCount, 8); i++) {
+        const txt = ((await toolbarButtons.nth(i).textContent().catch(() => null)) ?? '').trim();
+        if (txt) labels.push(txt);
+      }
+      console.log(`    🔍 Visible toolbar buttons: ${labels.join(', ')}`);
+    }
+
+    const hasErrorThumbnail = await page
+      .locator('div.error-thumbnail-background')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (hasErrorThumbnail) {
+      console.log('    🔍 Error warning thumbnail is visible on the form');
+    }
+  } catch {
+    // Non-critical — diagnostics should never block the flow.
+  }
 }
 
 /**
@@ -387,23 +447,28 @@ async function stableClick(
   await target.waitFor({ state: 'visible', timeout: timeoutMs });
   await expect(target).toBeEnabled({ timeout: timeoutMs });
 
-  // Scroll the element into the viewport so pointer events are not blocked by
-  // an out-of-view ancestor or a sticky header/footer overlay.
-  await target.scrollIntoViewIfNeeded({ timeout: timeoutMs });
+  // NOTE: Do NOT call scrollIntoViewIfNeeded() here.  Playwright's click()
+  // already scrolls the element into view using the correct scroll-chain.
+  // An explicit JS-level scroll can scroll the *page* when the target lives
+  // inside a cdk-overlay-pane (position:fixed), which repositions or hides
+  // the Angular Material overlay and causes the subsequent click to miss.
+
+  // Hover warm-up: move the mouse to the element and let Angular process the
+  // mouseenter event (ripple, focus ring, change-detection) BEFORE clicking.
+  // Without this, click()'s internal hover + click fires so fast that Angular
+  // components like particle-button-dropdown are still mid-transition when the
+  // mousedown lands, causing the click to register as just a hover.
+  try {
+    await target.hover({ timeout: timeoutMs });
+    await delay(100);
+  } catch {
+    // hover failed (e.g. element moved) — proceed to the click loop which
+    // has its own retries and fallbacks.
+  }
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      // trial: true verifies the element will accept the click (actionability
-      // check) without actually dispatching the event.
-      await target.click({ timeout: timeoutMs, trial: true });
-
-      // Brief settle delay: Angular Material buttons and dropdowns run a
-      // change-detection cycle after hover / focus that can leave the element
-      // in a transitioning state.  A short pause lets CSS animations finish
-      // before we dispatch the real click.
-      await delay(80);
-
       await target.click({ timeout: timeoutMs });
       return;
     } catch (error) {
@@ -414,7 +479,7 @@ async function stableClick(
     }
   }
 
-  // First fallback: force click (bypasses actionability, useful when an
+  // Fallback 1: force click — bypasses actionability checks (useful when an
   // invisible overlay intercepts pointer events).
   if (forceOnLastRetry) {
     try {
@@ -425,9 +490,8 @@ async function stableClick(
     }
   }
 
-  // Last-resort fallback: dispatch a synthetic click via the DOM.  This
-  // reaches the element's click handler even when Playwright's pointer-based
-  // click cannot land (e.g. the element is behind a non-interactable layer).
+  // Fallback 2: synthetic DOM click — reaches the handler even when
+  // Playwright's pointer-based click cannot land.
   try {
     await target.dispatchEvent('click');
     return;
@@ -459,7 +523,8 @@ async function stableHover(
   const postHoverDelayMs = options?.postHoverDelayMs ?? 150;
 
   await target.waitFor({ state: 'visible', timeout: timeoutMs });
-  await target.scrollIntoViewIfNeeded({ timeout: timeoutMs });
+  // Do NOT scrollIntoViewIfNeeded — Playwright's hover() handles scroll and
+  // a JS-level scroll can reposition cdk-overlay panels that host menu items.
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -731,6 +796,9 @@ async function processReceipt(
       console.log(`    \u26a0 Blocked receipt detected: ${msg}`);
       await dismissPopup(page);
 
+      // Capture screenshot + UI state for offline debugging.
+      await captureFailureDiagnostics(page, `phase1-receipt-${receipt.rcptMasterIndex}`);
+
       // Capture detailed validation errors from the error panel before blacklisting.
       const validationErrors = await extractValidationErrors(page);
       if (validationErrors.length > 0) {
@@ -831,8 +899,10 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
           await expect(removeDropdownButton).toHaveAttribute('aria-expanded', 'false', { timeout: 2000 });
         }
 
-        await removeDropdownButton.scrollIntoViewIfNeeded();
-        await delay(500);
+        // Let Playwright's click() handle scrolling — an explicit
+        // scrollIntoViewIfNeeded here would scroll the wrong container
+        // when the button is inside a child-form panel, causing the
+        // overlay to detach.
         await stableClick(removeDropdownButton, 'Remove dropdown button');
 
         if ((await removeDropdownButton.getAttribute('aria-expanded')) !== 'true') {
@@ -934,25 +1004,39 @@ async function updateReceiptInvoices(page: Page, receipt: ReceiptGroup): Promise
   }
 
   async function searchAndSelectInvoice(invNumber: string): Promise<void> {
+    // The query dialog may already be open from the previous step (options menu
+    // or direct-add button).  Locate the search input inside the dialog.
     const addDialogInput = page.locator('input[pendo-id="e3e-quick-find-search-field"]:visible').last();
     await addDialogInput.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await stableClick(addDialogInput, 'Add dialog quick-find input');
+    await addDialogInput.click({ timeout: config.defaultTimeoutMs });
     await addDialogInput.fill(invNumber);
 
     const searchButton = page.locator('button[pendo-id="e3e-query-dialog-search-button"]');
     await searchButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
     await stableClick(searchButton, 'Invoice dialog Search button');
 
+    // Wait for the ag-grid to finish loading results.  The grid adds an
+    // overlay wrapper while loading; wait for it to disappear, then wait for
+    // the first result row to render.
+    const gridLoadingOverlay = page.locator('.ag-overlay-loading-wrapper');
+    await gridLoadingOverlay.waitFor({ state: 'hidden', timeout: config.defaultTimeoutMs }).catch(() => {});
+
     const firstResultCheckbox = page
       .locator('.ag-center-cols-container .ag-row[row-index="0"] input[type="checkbox"]')
       .first();
     await firstResultCheckbox.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
-    await firstResultCheckbox.check();
+    await firstResultCheckbox.check({ timeout: config.defaultTimeoutMs });
 
     const selectButton = page.locator('button[pendo-id="e3e-query-dialog-select-button"]');
     await selectButton.waitFor({ state: 'visible', timeout: config.navigationTimeoutMs });
     await stableClick(selectButton, 'Invoice dialog Select button');
-    await page.waitForLoadState('domcontentloaded');
+
+    // Wait for the query dialog to close — this is the real sync point.
+    // domcontentloaded resolves instantly in a SPA and provides no
+    // synchronisation.  Waiting for the dialog/Select button to disappear
+    // ensures Angular has finished processing the selection.
+    await selectButton.waitFor({ state: 'hidden', timeout: config.navigationTimeoutMs }).catch(() => {});
+    await delay(300);
   }
 
   for (const [invoiceIndex, invNumber] of receipt.invNumbers.entries()) {
@@ -1111,6 +1195,12 @@ async function submitOpenedReceipts(
 
       console.log(`    \u26a0 Popup detected after Phase 3 submit: ${msg}`);
       await dismissPopup(page);
+
+      // Capture screenshot + UI state for offline debugging.
+      const receiptLabel = currentReceipt
+        ? `receipt-${currentReceipt.rcptMasterIndex}`
+        : `process-${currentProcessId ?? 'unknown'}`;
+      await captureFailureDiagnostics(page, `phase3-${receiptLabel}`);
 
       // Attempt to read detailed validation errors from the error panel.
       const validationErrors = await extractValidationErrors(page);
